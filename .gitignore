@@ -1,0 +1,59 @@
+# =============================================================
+#  CFA-NPC-main / CFANet .gitignore
+#  Repo pushed as code-only — no .nii.gz / checkpoints / caches.
+# =============================================================
+
+# ---- large data volumes (not in repo) ----
+TrainDataset/images/
+TrainDataset/masks/
+data/TestDataset/
+data/traindata/
+data/testdata/
+data/**/*.nii.gz
+data/**/*.nii
+data/**/*.npy
+data/**/*.npz
+
+# ---- model checkpoints / pretrained weights ----
+Snapshot/
+*.pth
+*.pt
+checkpoint/
+lib/res2net50_v1b_26w_4s-3cf99910.pth
+
+# ---- evaluation outputs ----
+res/
+eval/
+*.png.out
+npy/
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+
+# ---- virtual envs / editors ----
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# ---- logs / tensorboard / wandb ----
+*.log
+logs/
+runs/
+wandb/
+*.tfevents.*
+
+# ---- misc ----
+*.tmp
+*.bak
