@@ -94,7 +94,7 @@ def boundary_aware_bce(pred, mask, k=15):
 
 
 def small_target_loss(pred, mask,
-                      w_ft=1.0, w_bce=0.5, w_dice=0.5,
+                      w_ft=1.5, w_bce=0.3, w_dice=0.5,
                       ft_alpha=0.7, ft_beta=0.3, ft_gamma=0.75,
                       boundary_k=15):
     """
@@ -106,9 +106,16 @@ def small_target_loss(pred, mask,
 
     Args:
         pred, mask : logits / binary mask  (B, 1, H, W)
-        w_ft       : weight of Focal-Tversky (region-level, small-target)
-        w_bce      : weight of boundary-aware BCE (edge focus)
-        w_dice     : weight of Dice (overlap, imbalance-robust)
+        w_ft       : weight of Focal-Tversky (region-level, small-target).
+                     Default 1.5 (was 1.0) — this is the dominant signal
+                     for ~0.4% positive-pixel ratio.
+        w_bce      : weight of boundary-aware BCE.  Default 0.3 (was 0.5)
+                     — pure BCE drowns the signal in negative pixels for
+                     very small targets.
+        w_dice     : weight of Dice (overlap, imbalance-robust).
+        boundary_k : half-width of the boundary band.  15 is too wide for
+                     256x256 inputs; 7 keeps the band tight on the lesion
+                     edges and lets the gradient concentrate there.
     """
     return (w_ft   * focal_tversky_loss(pred, mask, ft_alpha, ft_beta, ft_gamma)
           + w_bce  * boundary_aware_bce (pred, mask, boundary_k)
@@ -122,25 +129,28 @@ def get_loader(root, split, batchsize, trainsize, num_workers=4,
                augment=True, shuffle=None,
                crop_size=0, mask_combine='or',
                resplit=True, seed=42,
-               train_ratio=0.8, val_ratio=0.1, test_ratio=0.1):
+               train_ratio=0.8, val_ratio=0.2, test_ratio=0.0):
     """
-    Build a torch.utils.data.DataLoader for the NIfTI medical-slice dataset.
+    Build a torch.utils.data.DataLoader for the per-patient NIfTI
+    medical-slice dataset.
 
     Every sample is a *paired* (image_t1, image_t2, mask) — the two
-    modalities of the same patient's same slice.  The split is
-    rebuilt deterministically from the paired (patient, idx_in_patient)
-    groups, since the original manifest split is made independently
-    per modality and would leave val/test with virtually no T1/T2
-    pairs.
+    modalities of the same patient's same slice.  When ``resplit`` is
+    True, the patients under ``root`` are deterministically shuffled
+    and split into train/val/test by patient; when False, every
+    patient in ``root`` is yielded regardless of the split name.
     """
     from data.dataset import MedicalSliceDataset
     if shuffle is None:
         shuffle = (split == 'train')
+    # resplit only makes sense on the training root; the test root is
+    # the held-out set so we want every patient yielded.
+    use_resplit = resplit and (split != 'test')
     ds = MedicalSliceDataset(root=root, split=split, trainsize=trainsize,
                              augment=augment,
                              crop_size=crop_size,
                              mask_combine=mask_combine,
-                             resplit=resplit, seed=seed,
+                             resplit=use_resplit, seed=seed,
                              train_ratio=train_ratio,
                              val_ratio=val_ratio,
                              test_ratio=test_ratio)
@@ -148,23 +158,25 @@ def get_loader(root, split, batchsize, trainsize, num_workers=4,
                       num_workers=num_workers, pin_memory=True, drop_last=(split == 'train'))
 
 
-def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step):
+def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
+          deep_sup_w=(1.0, 1.0, 1.0, 1.0), grad_clip=1.0, log_every=10):
     """
     Training iteration
-    :param train_loader:
-    :param model:
-    :param optimizer:
-    :param epoch:
-    :param opt:
-    :param loss_func:
-    :param total_step:
-    :return:
+
+    Stability tweaks (added to fix high per-batch loss variance):
+    - Multi-scale is OFF by default (use --size_rates 1 1 1 to keep it on).
+      Small targets (0.4% positive pixels) suffer at scale 1.25 because
+      the lesion shrinks to a handful of pixels.
+    - Grad-norm clipping (default 1.0) prevents the Adam optimizer from
+      being kicked by an occasional pathological batch.
+    - Deep-supervision weights (1.0, 1.0, 1.0, 1.0) so the three
+      intermediate heads all contribute (was implicit before but the
+      same mask was used as ground truth for all 4 outputs).
     """
     model.train()
 
-
-    size_rates = [0.75, 1, 1.25]
-
+    # multi-scale controlled by CLI; default is single-scale for stability
+    size_rates = [float(r) for r in opt.size_rates.split(',')] if opt.size_rates else [1.0]
 
     for step, batch in enumerate(train_loader):
 
@@ -189,17 +201,33 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step):
 
             # ---- forward ----
             sal_out1, sal_out2, sal_out3, mask = model(images_t1, images_t2)
-            loss_sal1  = small_target_loss(sal_out1, gts)
-            loss_sal2  = small_target_loss(sal_out2, gts)
-            loss_sal3  = small_target_loss(sal_out3, gts)
-            loss_mask  = small_target_loss(mask,    gts)
 
-            loss_total = loss_sal1 + loss_sal2 + loss_sal3 + loss_mask
+            # small_target_loss is parameterised via CLI; pass through
+            loss_sal1  = loss_func(sal_out1, gts)
+            loss_sal2  = loss_func(sal_out2, gts)
+            loss_sal3  = loss_func(sal_out3, gts)
+            loss_mask  = loss_func(mask,    gts)
+
+            w1, w2, w3, wm = deep_sup_w
+            loss_total = w1*loss_sal1 + w2*loss_sal2 + w3*loss_sal3 + wm*loss_mask
 
             loss_total.backward()
+
+            # ---- gradient clipping (stability) ----
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            # ---- warmup (linear over the first N steps) ----
+            if opt.warmup_steps > 0:
+                warm = min(1.0, (step + 1) / max(1, opt.warmup_steps))
+                for pg in optimizer.param_groups:
+                    base_lr = pg.get('base_lr', pg['lr'] / max(warm, 1e-6))
+                    pg['base_lr'] = base_lr
+                    pg['lr'] = base_lr * warm
+
             optimizer.step()
 
-        if step % 10 == 0 or step == total_step:
+        if step % log_every == 0 or step == total_step:
             print('[{}] => [Epoch Num: {:03d}/{:03d}] => [Global Step: {:04d}/{:04d}] => [Loss_sal1: {:.4f} Loss_sal2: {:.4f} Loss_sal3: {:.4f} Loss_mask: {:.4f} Loss_total: {:.4f}]'.
                   format(datetime.now(), epoch, opt.epoch, step, total_step, loss_sal1.data, loss_sal2.data, loss_sal3.data, loss_mask.data, loss_total.data))
 
@@ -262,9 +290,16 @@ if __name__ == "__main__":
     parser.add_argument('--save_model',  type=str,   default='./Snapshot/CFANet/')
     
     
-    parser.add_argument('--train_root',   type=str, default='./TrainDataset')
-    parser.add_argument('--val_root',     type=str, default='./TrainDataset')
-    parser.add_argument('--test_root',    type=str, default='./TrainDataset')
+    parser.add_argument('--train_root',   type=str, default='./data/traindata',
+                        help='Path to the train-data root (per-patient directory).')
+    parser.add_argument('--val_root',     type=str, default='./data/traindata',
+                        help='Path to the val-data root.  Defaults to traindata — '
+                             'the val split is carved out of traindata by the '
+                             'deterministic re-split.  Override only if you have a '
+                             'dedicated val/ directory.')
+    parser.add_argument('--test_root',    type=str, default='./data/testdata',
+                        help='Path to the test-data root.  This is the held-out '
+                             'test set; resplit is automatically disabled.')
 
     # ---- DataLoader / augmentation options for the slice-level pipeline ----
     # NOTE: every slice of every split is yielded (no empty-mask filtering).
@@ -278,16 +313,41 @@ if __name__ == "__main__":
                              "'or'=union (default), 'and'=intersection, "
                              "'t1'/'t2'=use that mask alone.")
     parser.add_argument('--resplit',      action='store_true', default=True,
-                        help='Re-split paired (T1,T2) groups deterministically '
-                             '(80/10/10).  The original manifest split is per-modality '
-                             'and would leave val/test with almost no T1/T2 pairs.')
+                        help='Re-split paired (T1,T2) patients deterministically '
+                             '(default 80/20).  Automatically disabled for the '
+                             'test root.')
     parser.add_argument('--no_resplit',   dest='resplit', action='store_false',
                         help='Use the original manifest split instead of re-splitting.')
     parser.add_argument('--resplit_seed', type=int, default=42,
                         help='Random seed for the deterministic re-split.')
     parser.add_argument('--train_ratio',  type=float, default=0.8)
-    parser.add_argument('--val_ratio',    type=float, default=0.1)
-    parser.add_argument('--test_ratio',   type=float, default=0.1)
+    parser.add_argument('--val_ratio',    type=float, default=0.2)
+    parser.add_argument('--test_ratio',   type=float, default=0.0,
+                        help='Fraction of traindata patients used for in-domain test. '
+                             'The held-out test set comes from --test_root.')
+
+    # ---- Loss / stability knobs (used to fix per-batch loss variance) ----
+    parser.add_argument('--w_ft',        type=float, default=1.5,
+                        help='Weight of Focal-Tversky (small-target friendly).')
+    parser.add_argument('--w_bce',       type=float, default=0.3,
+                        help='Weight of boundary-aware BCE.')
+    parser.add_argument('--w_dice',      type=float, default=0.5,
+                        help='Weight of Dice.')
+    parser.add_argument('--ft_gamma',    type=float, default=0.75,
+                        help='Focusing exponent for Focal-Tversky (>=1 sharpens on hard pixels).')
+    parser.add_argument('--boundary_k',  type=int,   default=7,
+                        help='Half-width of the boundary band for boundary-aware BCE. '
+                             '15 was too wide for 256x256 small targets.')
+    parser.add_argument('--size_rates',  type=str,   default='1',
+                        help='Comma-separated multi-scale rates (e.g. "0.75,1,1.25"). '
+                             'Default single-scale "1" to keep loss stable on tiny targets.')
+    parser.add_argument('--grad_clip',   type=float, default=1.0,
+                        help='Max gradient norm.  0 disables clipping.')
+    parser.add_argument('--warmup_steps', type=int,  default=200,
+                        help='Linear LR warmup over the first N global steps.  0 disables.')
+    parser.add_argument('--deep_sup_w',  type=str,   default='1,1,1,1',
+                        help='Deep-supervision weights for (sal1, sal2, sal3, mask). '
+                             'Comma-separated, e.g. "0.5,0.5,0.5,1.0".')
 
     # ---- Pretrained-weight options ----
     parser.add_argument('--pretrain_ckpt', type=str, default='',
@@ -389,7 +449,17 @@ if __name__ == "__main__":
 
 
     optimizer = torch.optim.Adam(model.parameters(), opt.lr)
-    LogitsBCE = torch.nn.BCEWithLogitsLoss()
+
+    # ------------------ Configurable loss (CLI-controlled weights) ---------- #
+    def make_loss(p, m):
+        return small_target_loss(
+            p, m,
+            w_ft=opt.w_ft, w_bce=opt.w_bce, w_dice=opt.w_dice,
+            ft_gamma=opt.ft_gamma, boundary_k=opt.boundary_k,
+        )
+    loss_func = make_loss
+    deep_sup_w = tuple(float(x) for x in opt.deep_sup_w.split(','))
+    assert len(deep_sup_w) == 4, f'--deep_sup_w must have 4 values, got {opt.deep_sup_w}'
 
     # ------------------ DataLoaders (NIfTI medical slices) ------------------ #
     train_loader = get_loader(opt.train_root, split='train',
@@ -428,7 +498,8 @@ if __name__ == "__main__":
         
         adjust_lr(optimizer, epoch_iter, opt.decay_rate, opt.decay_epoch)
         
-        train(train_loader, model, optimizer, epoch_iter,opt, LogitsBCE, total_step)
+        train(train_loader, model, optimizer, epoch_iter, opt, loss_func, total_step,
+              deep_sup_w=deep_sup_w, grad_clip=opt.grad_clip)
         #test(test_loader,   model, epoch_iter, opt.save_model)
         
         

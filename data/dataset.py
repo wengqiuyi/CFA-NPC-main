@@ -2,37 +2,38 @@
 data/dataset.py
 ================
 
-**Paired** slice-level dataset loader for the **NIfTI 3D-MRI T1/T2**
-cross-modal segmentation task.
+Paired T1/T2 slice-level dataset for the **per-patient directory**
+layout that the user actually uploaded:
 
-The manifest contains one row per *file*, with ``seq ∈ {T1, T2}``.
-T1 and T2 of the same patient are stored as **two separate files**
-(e.g. ``case0298_T1_0.nii.gz`` and ``case0299_T2_0.nii.gz``) — they
-share the same ``patient`` and ``idx_in_patient`` but have different
-``case_id`` values.
+    data/
+    ├── traindata/
+    │   └── <patient_id>/
+    │       ├── t1/
+    │       │   ├── <T1 image>.nii.gz        (the actual T1 scan)
+    │       │   └── T1-node-label_*.nii.gz   (the T1 mask)
+    │       └── t2/
+    │           ├── <T2 image>.nii.gz        (the actual T2 scan)
+    │           └── T2-node-label_*.nii.gz   (the T2 mask)
+    └── testdata/
+        └── <patient_id>/ ...
 
-This loader:
+Each (image, mask) pair is a 3-D volume.  The mask is identified by
+the substring ``label`` (case-insensitive); the image is the other
+``.nii.gz`` file.  When a patient has more than one (image, mask)
+pair in a modality (e.g. consecutive slice ranges of the same
+series) the loader matches image ↔ mask by their trailing
+``_<idx>`` suffix and **only keeps (T1, T2) suffix matches that
+exist in both modalities**.
 
-1.  Groups rows by ``(patient, idx_in_patient)`` and keeps only groups
-    that have **both** a T1 and a T2 file.
-2.  Reads the T1 and T2 masks once to determine the depth ``D`` and
-    the per-slice target.  The two masks are combined with a
-    configurable operator (default = OR, since empirically the same
-    lesion is annotated with slight disagreement between modalities).
-3.  Expands every (T1, T2) volume pair to ``D`` independent
-    ``(slice_t1, slice_t2, mask)`` training samples.
-4.  In ``__getitem__`` the T1 and T2 slices are normalised and
-    augmented **independently in intensity** (different MRI contrasts
-    need different intensity jitter) but **identically in geometry**
-    (a horizontal flip must flip both modalities together).
-5.  Outputs ``image_t1``, ``image_t2`` and ``mask`` so the
-    ``dual_backbone`` CFANet can be trained on real cross-modal pairs.
+The two masks for the same slice are combined with a configurable
+operator (default = OR) so the model sees a single target.
 """
 
-import csv
 import os
 import random
+import re
 from collections import OrderedDict
+from pathlib import Path
 
 import numpy as np
 import SimpleITK as sitk
@@ -45,19 +46,13 @@ from torch.utils.data import Dataset
 # Volume-level LRU cache (keyed on a single .nii.gz path)
 # --------------------------------------------------------------------------- #
 class _VolumeCache:
-    """Tiny LRU cache for the most-recently-used 3-D volumes.
-
-    A single volume is ~16 MB (16 × 512 × 512 float32).  Caching the
-    last few volumes avoids re-reading the same .nii.gz from disk
-    when a DataLoader worker iterates over neighbouring slice indices
-    of the same volume.
-    """
+    """Tiny LRU cache for the most-recently-used 3-D volumes."""
 
     def __init__(self, capacity: int = 8):
         self.capacity = capacity
         self.cache = OrderedDict()
 
-    def get(self, path: str):
+    def get(self, path):
         if path in self.cache:
             self.cache.move_to_end(path)
             return self.cache[path]
@@ -67,36 +62,73 @@ class _VolumeCache:
             self.cache.popitem(last=False)
         return arr
 
-    def get_many(self, paths):
-        return [self.get(p) for p in paths]
 
-
-# One cache per process is plenty (4 paired volumes × 2 mods + mask ≈ 96 MB)
-_VOLUME_CACHE = _VolumeCache(capacity=4)
+# Module-level cache (per worker process)
+_VOLUME_CACHE = _VolumeCache(capacity=8)
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _percentile_clip(arr: np.ndarray, low=0.5, high=99.5) -> np.ndarray:
-    """Clip extreme intensities (typical for MRI)."""
+_LABEL_PAT = re.compile(r'_(\d+)$')   # trailing _<digits>
+
+
+def _split_idx_from_name(stem: str) -> str:
+    """Extract the trailing _<idx> from a filename stem, or '' if absent.
+
+    Examples
+    --------
+    'T1-node-label_5'         -> '_5'
+    'T1-node-label'           -> ''
+    '5 OAx T1 FSE_3'          -> '_3'
+    '5 OAx T1 FSE'            -> ''
+    """
+    m = _LABEL_PAT.search(stem)
+    return f'_{m.group(1)}' if m else ''
+
+
+def _is_mask(fname: str) -> bool:
+    """Mask file heuristic: filename contains the word 'label' (or 'mask')."""
+    low = fname.lower()
+    return ('label' in low) or ('mask' in low)
+
+
+def _pair_with_suffix(files):
+    """Group a list of (path, stem) by their trailing _<idx> suffix.
+
+    Returns
+    -------
+    dict : suffix -> (image_path, mask_path)
+           Only suffix groups that have BOTH an image and a mask are kept.
+    """
+    by_suffix = {}
+    for path, stem in files:
+        sfx = _split_idx_from_name(stem)
+        slot = by_suffix.setdefault(sfx, [None, None])   # [img, msk]
+        if _is_mask(path.name):
+            slot[1] = path
+        else:
+            slot[0] = path
+    return {sfx: (img, msk) for sfx, (img, msk) in by_suffix.items()
+            if img is not None and msk is not None}
+
+
+def _percentile_clip(arr, low=0.5, high=99.5):
     lo = np.percentile(arr, low)
     hi = np.percentile(arr, high)
     return np.clip(arr, lo, hi)
 
 
-def _zscore(arr: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """Per-image z-score normalisation."""
+def _zscore(arr, eps=1e-6):
     mean = arr.mean()
-    std  = arr.std()
+    std = arr.std()
     if std < eps:
         std = eps
     return (arr - mean) / std
 
 
-def _resize_2d(img: np.ndarray, size: int, mode: str) -> np.ndarray:
-    """Resize a 2-D numpy array to ``(size, size)``."""
-    t = torch.from_numpy(img).float().unsqueeze(0).unsqueeze(0)   # (1,1,H,W)
+def _resize_2d(img, size, mode):
+    t = torch.from_numpy(img).float().unsqueeze(0).unsqueeze(0)
     if mode == 'bilinear':
         out = TF.interpolate(t, size=(size, size), mode='bilinear', align_corners=False)
     else:
@@ -105,12 +137,6 @@ def _resize_2d(img: np.ndarray, size: int, mode: str) -> np.ndarray:
 
 
 def _random_crop(img1, img2, msk, crop_h, crop_w):
-    """Random spatial crop with the same crop box for img1/img2/msk.
-
-    The T1, T2 and mask MUST be cropped together (same anatomical
-    region).  Pads with image mean / mask 0 if the requested crop is
-    larger than the input.
-    """
     H, W = img1.shape[-2:]
     pad_h = max(0, crop_h - H)
     pad_w = max(0, crop_w - W)
@@ -119,42 +145,29 @@ def _random_crop(img1, img2, msk, crop_h, crop_w):
                       constant_values=float(img1.mean()))
         img2 = np.pad(img2, ((0, pad_h), (0, pad_w)), mode='constant',
                       constant_values=float(img2.mean()))
-        msk  = np.pad(msk,  ((0, pad_h), (0, pad_w)), mode='constant',
-                      constant_values=0.0)
+        msk = np.pad(msk, ((0, pad_h), (0, pad_w)), mode='constant',
+                     constant_values=0.0)
         H, W = img1.shape
-    top  = random.randint(0, H - crop_h)
+    top = random.randint(0, H - crop_h)
     left = random.randint(0, W - crop_w)
     return (img1[top:top + crop_h, left:left + crop_w].copy(),
             img2[top:top + crop_h, left:left + crop_w].copy(),
-            msk [top:top + crop_h, left:left + crop_w].copy())
+            msk[top:top + crop_h, left:left + crop_w].copy())
 
 
-def _gamma_jitter(arr: np.ndarray, gamma_range=(0.7, 1.4), eps: float = 1e-6) -> np.ndarray:
-    """Per-modality gamma correction (random contrast)."""
+def _gamma_jitter(arr, gamma_range=(0.7, 1.4), eps=1e-6):
     g = random.uniform(*gamma_range)
     a = arr - arr.min() + eps
     a = a / (a.max() + eps)
     a = np.power(a, 1.0 / g)
-    a = (a - a.mean()) / (a.std() + eps)
-    return a
+    return (a - a.mean()) / (a.std() + eps)
 
 
-def _brightness_contrast(arr: np.ndarray, b_range=(-0.1, 0.1), c_range=(0.8, 1.2)):
-    """Per-modality brightness (additive) and contrast (multiplicative) jitter."""
+def _brightness_contrast(arr, b_range=(-0.1, 0.1), c_range=(0.8, 1.2)):
     return arr * random.uniform(*c_range) + random.uniform(*b_range)
 
 
-def _combine_masks(t1_m: np.ndarray, t2_m: np.ndarray, mode: str) -> np.ndarray:
-    """Combine T1 and T2 binary masks for the same anatomical slice.
-
-    mode
-    ----
-    'or'  : union — used by default, captures any pixel annotated
-            in either modality (most permissive)
-    'and' : intersection — very conservative
-    't1'  : use T1 mask only
-    't2'  : use T2 mask only
-    """
+def _combine_masks(t1_m, t2_m, mode):
     if mode == 'or':
         return ((t1_m > 0.5) | (t2_m > 0.5)).astype(np.float32)
     if mode == 'and':
@@ -170,34 +183,27 @@ def _combine_masks(t1_m: np.ndarray, t2_m: np.ndarray, mode: str) -> np.ndarray:
 # Dataset
 # --------------------------------------------------------------------------- #
 class MedicalSliceDataset(Dataset):
-    """
+    """Per-patient paired T1/T2 slice dataset.
+
     Args
     ----
-    root          : path to the manifest.csv parent directory
-    split         : 'train' | 'val' | 'test'
+    root          : path to either ``data/traindata`` or ``data/testdata``
+    split         : 'train' | 'val' | 'test'  (only used for logging and
+                    for the resplit logic)
     trainsize     : square resize target (default 256)
     augment       : whether to apply random augmentation
-    crop_size     : if > 0, random-crop to (crop_size, crop_size) at
-                    native resolution BEFORE resize.  Try 384 for
-                    small-target MRI segmentation.
-    mask_combine  : 'or' | 'and' | 't1' | 't2' — how to merge the T1
-                    and T2 mask of the same slice.  Default 'or'.
-    require_pair  : if True (default), only yield groups that have
-                    BOTH T1 and T2 files for the same (patient, idx).
-                    If False, fall back to single-modality samples
-                    (degenerate, only used for debugging).
-    resplit       : if True (default), ignore the split column in
-                    manifest.csv and **re-split all paired groups**
-                    deterministically by (train_ratio, val_ratio,
-                    test_ratio).  The original manifest split was made
-                    independently per modality so it puts T1 val
-                    and T2 val into completely different patients —
-                    this is incompatible with the dual-input task.
-    seed          : random seed used for re-splitting.
-    train_ratio   : fraction of paired groups used for training.
-    val_ratio     : fraction used for validation.
-    test_ratio    : fraction used for testing.  The remainder is
-                    dropped (use 0.8 / 0.1 / 0.1 by default).
+    crop_size     : if > 0, random-crop to (crop_size, crop_size) at native
+                    resolution BEFORE resize
+    mask_combine  : 'or' | 'and' | 't1' | 't2'  (default 'or')
+    resplit       : if True, split paired patients deterministically
+                    (used for traindata → train/val).  Set False for
+                    testdata (every patient is test).
+    seed          : random seed for the deterministic re-split
+    train_ratio   : fraction used for training
+    val_ratio     : fraction used for validation
+    test_ratio    : fraction used for testing (usually 0 for traindata)
+    require_pair  : if True, only yield patients that have a complete
+                    T1+T2 pair (image AND mask, with matching suffix)
     """
 
     def __init__(self,
@@ -207,217 +213,184 @@ class MedicalSliceDataset(Dataset):
                  augment: bool = True,
                  crop_size: int = 0,
                  mask_combine: str = 'or',
-                 require_pair: bool = True,
                  resplit: bool = True,
                  seed: int = 42,
                  train_ratio: float = 0.8,
-                 val_ratio: float = 0.1,
-                 test_ratio: float = 0.1):
+                 val_ratio: float = 0.2,
+                 test_ratio: float = 0.0,
+                 require_pair: bool = True):
         super().__init__()
-        self.root        = root
-        self.split       = split
-        self.trainsize   = trainsize
-        self.augment     = augment
-        self.crop_size   = int(crop_size) if crop_size else 0
+        self.root         = str(root)
+        self.split        = split
+        self.trainsize    = trainsize
+        self.augment      = augment
+        self.crop_size    = int(crop_size) if crop_size else 0
         self.mask_combine = mask_combine
-        self.require_pair = require_pair
         self.resplit      = resplit
         self.seed         = seed
+        self.require_pair = require_pair
 
-        manifest = os.path.join(root, 'manifest.csv')
-        # ------------------------------------------------------------------
-        # 1) read manifest, normalise path separator (Windows -> POSIX)
-        # ------------------------------------------------------------------
-        rows = []
-        with open(manifest, 'r', newline='') as f:
-            reader = csv.DictReader(
-                f,
-                fieldnames=['case_id', 'patient', 'seq', 'idx_in_patient',
-                            'image', 'mask', 'image_shape', 'mask_shape', 'split'])
-            for row in reader:
-                img_rel = row['image'].strip().replace('\\', '/')
-                msk_rel = row['mask'].strip().replace('\\', '/')
-                rows.append({
-                    'case_id'      : row['case_id'].strip(),
-                    'patient'      : row['patient'].strip(),
-                    'seq'          : row['seq'].strip().upper(),
-                    'idx_in_patient': row['idx_in_patient'].strip(),
-                    'image'        : os.path.join(root, img_rel),
-                    'mask'         : os.path.join(root, msk_rel),
-                    'split'        : row['split'].strip().lower(),
-                })
-        if not rows:
-            raise RuntimeError(f'Empty manifest {manifest}')
+        # --------------------------------------------------------------
+        # 1) enumerate patients, pair (T1 img, T1 msk) and (T2 img, T2 msk)
+        #    by trailing _<idx> suffix
+        # --------------------------------------------------------------
+        root_path = Path(self.root)
+        if not root_path.is_dir():
+            raise FileNotFoundError(f'root does not exist: {root_path}')
 
-        # ------------------------------------------------------------------
-        # 2) group by (patient, idx_in_patient, split) and build pairs
-        # ------------------------------------------------------------------
-        groups = {}   # (patient, idx, split) -> {'T1': row, 'T2': row}
-        for r in rows:
-            key = (r['patient'], r['idx_in_patient'], r['split'])
-            slot = groups.setdefault(key, {})
-            if r['seq'] in ('T1', 'T2'):
-                slot[r['seq']] = r
+        all_patients = []   # (patient_id, [(t1_img, t1_msk, t2_img, t2_msk), ...])
+        n_skip_dir     = 0
+        n_skip_incompl = 0
+        n_skip_nomatch = 0
+        n_skip_depth   = 0
 
+        for pdir in sorted(p for p in root_path.iterdir() if p.is_dir()):
+            t1d = pdir / 't1'
+            t2d = pdir / 't2'
+            if not t1d.is_dir() or not t2d.is_dir():
+                n_skip_dir += 1
+                continue
+
+            t1_files = [(f, f.stem) for f in t1d.iterdir() if f.suffix == '.gz']
+            t2_files = [(f, f.stem) for f in t2d.iterdir() if f.suffix == '.gz']
+
+            t1_pairs = _pair_with_suffix(t1_files)   # suffix -> (img, msk)
+            t2_pairs = _pair_with_suffix(t2_files)
+            if not t1_pairs or not t2_pairs:
+                n_skip_incompl += 1
+                continue
+
+            # keep only suffixes that exist in BOTH modalities
+            common = set(t1_pairs) & set(t2_pairs)
+            if not common:
+                n_skip_nomatch += 1
+                continue
+
+            # build (T1_img, T1_msk, T2_img, T2_msk) per suffix
+            series = []
+            for sfx in sorted(common):
+                t1_img, t1_msk = t1_pairs[sfx]
+                t2_img, t2_msk = t2_pairs[sfx]
+                # read masks ONCE to learn depth and combined-target
+                try:
+                    t1m = sitk.GetArrayFromImage(sitk.ReadImage(str(t1_msk)))
+                    t2m = sitk.GetArrayFromImage(sitk.ReadImage(str(t2_msk)))
+                except Exception as e:
+                    print(f'[WARN] {pdir.name}/{sfx}: mask read failed: {e}, skip')
+                    continue
+                # squeeze to (D, H, W)
+                while t1m.ndim > 3: t1m = np.take(t1m, 0, axis=0)
+                while t2m.ndim > 3: t2m = np.take(t2m, 0, axis=0)
+                if t1m.ndim == 2: t1m = t1m[None]
+                if t2m.ndim == 2: t2m = t2m[None]
+                D1, D2 = t1m.shape[0], t2m.shape[0]
+                if D1 != D2:
+                    n_skip_depth += 1
+                    print(f'[WARN] {pdir.name}/{sfx}: T1 depth {D1} != T2 depth {D2}, skip')
+                    continue
+                D = D1
+                # pre-compute per-slice target presence using OR
+                for s in range(D):
+                    m_t1 = (t1m[s] > 0.5) if t1m is not None else None
+                    m_t2 = (t2m[s] > 0.5) if t2m is not None else None
+                    if self.mask_combine == 'or':
+                        has = bool((m_t1 | m_t2).any())
+                    elif self.mask_combine == 'and':
+                        has = bool((m_t1 & m_t2).any())
+                    elif self.mask_combine == 't1':
+                        has = bool(m_t1.any())
+                    else:  # 't2'
+                        has = bool(m_t2.any())
+                    series.append((
+                        str(t1_img), str(t1_msk),
+                        str(t2_img), str(t2_msk),
+                        s, has,
+                    ))
+
+            if series:
+                all_patients.append((pdir.name, series))
+
+        if not all_patients:
+            raise RuntimeError(
+                f'No samples in {self.root} '
+                f'(skipped: dir={n_skip_dir}, incompl={n_skip_incompl}, '
+                f'no_match={n_skip_nomatch}, depth={n_skip_depth})')
+
+        # --------------------------------------------------------------
+        # 2) resplit (deterministic, per-patient)
+        # --------------------------------------------------------------
+        patient_ids = [p[0] for p in all_patients]
         if self.resplit:
-            # --------------------------------------------------------------
-            # Rebuild the split from scratch, treating every (patient, idx)
-            # that has BOTH modalities as one indivisible unit.  This is
-            # necessary because the original manifest split is made
-            # independently per modality, so the T1 val set and the T2
-            # val set come from completely different patients and the
-            # dual-input task would have nothing to evaluate on.
-            # --------------------------------------------------------------
-            pair_keys = set()    # (patient, idx) that have BOTH
-            for (pat, idx, _sp), slot in groups.items():
-                if 'T1' in slot and 'T2' in slot:
-                    pair_keys.add((pat, idx))
-
-            pair_keys = sorted(pair_keys)
             rng = random.Random(self.seed)
-            rng.shuffle(pair_keys)
-
-            n_total = len(pair_keys)
+            ids = list(patient_ids)
+            rng.shuffle(ids)
+            n_total = len(ids)
             n_train = int(round(n_total * train_ratio))
             n_val   = int(round(n_total * val_ratio))
             n_test  = int(round(n_total * test_ratio))
-            # ensure at least 1 group per non-empty split
             if train_ratio > 0: n_train = max(n_train, 1)
             if val_ratio   > 0: n_val   = max(n_val,   1)
             if test_ratio  > 0: n_test  = max(n_test,  1)
-            # cap at n_total
             over = max(0, n_train + n_val + n_test - n_total)
             n_train -= min(over, n_train)
-
-            train_keys = pair_keys[:n_train]
-            val_keys   = pair_keys[n_train:n_train + n_val]
-            test_keys  = pair_keys[n_train + n_val:n_train + n_val + n_test]
-
+            train_ids = set(ids[:n_train])
+            val_ids   = set(ids[n_train:n_train + n_val])
+            test_ids  = set(ids[n_train + n_val:n_train + n_val + n_test])
             if split == 'train':
-                allowed_pairs = set(train_keys)
+                allowed = train_ids
             elif split == 'val':
-                allowed_pairs = set(val_keys)
+                allowed = val_ids
             elif split == 'test':
-                allowed_pairs = set(test_keys)
+                allowed = test_ids
             else:
-                raise ValueError(f"Unknown split={split}")
+                raise ValueError(f"Unknown split: {split}")
             self._split_sizes = (n_train, n_val, n_test, n_total)
-
-            # rebuild groups: keep only the (pat, idx) for this split,
-            # regardless of the original `split` column.
-            new_groups = {}
-            for (pat, idx, _sp), slot in groups.items():
-                if (pat, idx) not in allowed_pairs:
-                    continue
-                if 'T1' not in slot or 'T2' not in slot:
-                    continue
-                new_groups[(pat, idx, split.lower())] = slot
-            groups = new_groups
         else:
-            # legacy: use the manifest's split column directly
-            groups = {k: v for k, v in groups.items() if k[2] == split.lower()}
+            allowed = set(patient_ids)
+            self._split_sizes = (0, 0, 0, len(patient_ids))
 
-        if not groups:
-            raise RuntimeError(f'No paired samples for split={split}')
-
-        # ------------------------------------------------------------------
-        # 3) build sample list, reading each mask pair ONCE to learn
-        #    the depth D, the per-slice target (combined mask > 0.5),
-        #    and to flag a healthy depth match between T1 & T2.
-        # ------------------------------------------------------------------
-        all_samples = []   # (t1_img, t2_img, t1_msk, t2_msk, slice_idx, has_target)
-        n_skipped_no_pair = 0
-        n_skipped_depth   = 0
-        for (patient, idx, _sp), slot in groups.items():
-            if self.require_pair and not ('T1' in slot and 'T2' in slot):
-                n_skipped_no_pair += 1
+        # --------------------------------------------------------------
+        # 3) build flat sample list (one entry per 2-D slice)
+        # --------------------------------------------------------------
+        all_samples = []
+        for pid, series in all_patients:
+            if pid not in allowed:
                 continue
-            t1 = slot.get('T1')
-            t2 = slot.get('T2')
-            try:
-                t1_m = sitk.GetArrayFromImage(sitk.ReadImage(t1['mask'])) if t1 else None
-                t2_m = sitk.GetArrayFromImage(sitk.ReadImage(t2['mask'])) if t2 else None
-            except Exception as e:
-                print(f'[WARN] failed to read mask for {patient}/{idx}: {e}, skipping')
-                continue
-
-            # squeeze to (D, H, W)
-            def _to_3d(a):
-                while a is not None and a.ndim > 3:
-                    a = np.take(a, 0, axis=0)
-                if a is not None and a.ndim == 2:
-                    a = a[None]
-                return a
-
-            t1_m = _to_3d(t1_m)
-            t2_m = _to_3d(t2_m)
-
-            # depth sanity check
-            D1 = t1_m.shape[0] if t1_m is not None else None
-            D2 = t2_m.shape[0] if t2_m is not None else None
-            if t1_m is not None and t2_m is not None and D1 != D2:
-                print(f'[WARN] {patient}/{idx} T1 depth {D1} != T2 depth {D2}, skipping')
-                n_skipped_depth += 1
-                continue
-            D = D1 if D1 is not None else D2
-            # build per-slice combined mask target
-            for s in range(D):
-                m_t1 = (t1_m[s] > 0.5) if t1_m is not None else np.zeros_like(t2_m[s], dtype=bool)
-                m_t2 = (t2_m[s] > 0.5) if t2_m is not None else np.zeros_like(t1_m[s], dtype=bool)
-                if self.mask_combine == 'or':
-                    has = bool((m_t1 | m_t2).any())
-                elif self.mask_combine == 'and':
-                    has = bool((m_t1 & m_t2).any())
-                elif self.mask_combine == 't1':
-                    has = bool(m_t1.any())
-                else:  # 't2'
-                    has = bool(m_t2.any())
-                all_samples.append((
-                    t1['image'] if t1 else None,
-                    t2['image'] if t2 else None,
-                    t1['mask']  if t1 else None,
-                    t2['mask']  if t2 else None,
-                    s,
-                    has,
-                ))
-
+            all_samples.extend(series)
         if not all_samples:
             raise RuntimeError(
-                f'No samples for split={split} '
-                f'(skipped_no_pair={n_skipped_no_pair}, skipped_depth={n_skipped_depth})')
+                f'split={split} got 0 samples '
+                f'(root={self.root}, total patients={len(patient_ids)})')
 
-        # No filtering — every slice of every paired group is yielded.
         self.samples = all_samples
 
-        # ------------------------------------------------------------------
         # log
-        # ------------------------------------------------------------------
         n_total = len(self.samples)
         n_pos   = sum(1 for s in self.samples if s[5])
-        n_paired_vol = len(groups)
+        n_pat   = sum(1 for pid, _ in all_patients if pid in allowed)
         extra = ''
         if self.resplit and hasattr(self, '_split_sizes'):
             nt, nv, nte, _ = self._split_sizes
             extra = f'  re-split=[train:{nt}/val:{nv}/test:{nte}]'
-        print(f'[MedicalSliceDataset] split={split:<5}  '
-              f'paired_volumes={n_paired_vol}  '
+        print(f'[MedicalSliceDataset] root={self.root}  split={split:<5}  '
+              f'patients={n_pat}  '
               f'samples={n_total} (pos={n_pos}, neg={n_total - n_pos})  '
               f'crop={self.crop_size or "off"}  augment={self.augment}  '
               f'mask_combine={mask_combine}  trainsize={trainsize}'
               f'{extra}')
 
+    # ------------------------------------------------------------------ #
     def __len__(self):
         return len(self.samples)
 
     # ------------------------------------------------------------------ #
     def __getitem__(self, idx):
-        t1_path, t2_path, t1_msk_path, t2_msk_path, slice_idx, _has = self.samples[idx]
+        t1_img_path, t1_msk_path, t2_img_path, t2_msk_path, s, _has = self.samples[idx]
 
-        # ---- 1. load volumes from cache (lazy) ----
-        t1_vol = _VOLUME_CACHE.get(t1_path) if t1_path else None
-        t2_vol = _VOLUME_CACHE.get(t2_path) if t2_path else None
-        t1m_vol = _VOLUME_CACHE.get(t1_msk_path) if t1_msk_path else None
-        t2m_vol = _VOLUME_CACHE.get(t2_msk_path) if t2_msk_path else None
+        t1_vol = _VOLUME_CACHE.get(t1_img_path)
+        t2_vol = _VOLUME_CACHE.get(t2_img_path)
+        t1m_vol = _VOLUME_CACHE.get(t1_msk_path)
+        t2m_vol = _VOLUME_CACHE.get(t2_msk_path)
 
         def _slice(arr, s):
             if arr is None: return None
@@ -425,69 +398,49 @@ class MedicalSliceDataset(Dataset):
             D = arr.shape[0]
             return arr[min(s, D - 1)]
 
-        img1 = _slice(t1_vol,  slice_idx)
-        img2 = _slice(t2_vol,  slice_idx)
-        msk1 = _slice(t1m_vol, slice_idx)
-        msk2 = _slice(t2m_vol, slice_idx)
+        img1 = _slice(t1_vol, s)
+        img2 = _slice(t2_vol, s)
+        msk1 = _slice(t1m_vol, s)
+        msk2 = _slice(t2m_vol, s)
 
-        # ---- 2. per-modality normalisation (T1 and T2 have very
-        #         different intensity distributions → must do this
-        #         independently) ----
-        img1 = _percentile_clip(img1)
-        img1 = _zscore(img1)
-        img2 = _percentile_clip(img2)
-        img2 = _zscore(img2)
+        # per-modality normalisation
+        img1 = _percentile_clip(img1); img1 = _zscore(img1)
+        img2 = _percentile_clip(img2); img2 = _zscore(img2)
         msk  = _combine_masks(msk1 if msk1 is not None else np.zeros_like(img1),
                               msk2 if msk2 is not None else np.zeros_like(img2),
                               self.mask_combine)
 
-        # ---- 3. augmentations (train only) ----
+        # augment
         if self.augment and self.split == 'train':
-            # 3.1 random crop — SAME box for T1/T2/mask
             if self.crop_size > 0 and (img1.shape[0] >= self.crop_size and
                                        img1.shape[1] >= self.crop_size):
                 img1, img2, msk = _random_crop(img1, img2, msk,
                                                self.crop_size, self.crop_size)
-
-            # 3.2 horizontal flip — SAME for T1/T2/mask
             if random.random() < 0.5:
-                img1 = img1[:, ::-1].copy()
-                img2 = img2[:, ::-1].copy()
-                msk  = msk [:, ::-1].copy()
-            # 3.3 vertical flip
+                img1 = img1[:, ::-1].copy(); img2 = img2[:, ::-1].copy(); msk = msk[:, ::-1].copy()
             if random.random() < 0.5:
-                img1 = img1[::-1, :].copy()
-                img2 = img2[::-1, :].copy()
-                msk  = msk [::-1, :].copy()
-            # 3.4 random 90-deg rotation
+                img1 = img1[::-1, :].copy(); img2 = img2[::-1, :].copy(); msk = msk[::-1, :].copy()
             k = random.randint(0, 3)
             if k:
                 img1 = np.rot90(img1, k=k).copy()
                 img2 = np.rot90(img2, k=k).copy()
                 msk  = np.rot90(msk,  k=k).copy()
-
-            # 3.5 intensity jitter — INDEPENDENT for T1 and T2
-            #     (T1 and T2 are different physical contrasts)
-            if random.random() < 0.5:
-                img1 = _gamma_jitter(img1)
-            if random.random() < 0.5:
-                img2 = _gamma_jitter(img2)
-            if random.random() < 0.5:
-                img1 = _brightness_contrast(img1)
-            if random.random() < 0.5:
-                img2 = _brightness_contrast(img2)
-            # 3.6 light gaussian noise — applied to BOTH (same scanner)
-            if random.random() < 0.2:
+            # intensity augmentations — reduced probability (was 0.5/0.5/0.2)
+            # to prevent per-batch loss spikes
+            if random.random() < 0.30: img1 = _gamma_jitter(img1)
+            if random.random() < 0.30: img2 = _gamma_jitter(img2)
+            if random.random() < 0.30: img1 = _brightness_contrast(img1)
+            if random.random() < 0.30: img2 = _brightness_contrast(img2)
+            if random.random() < 0.10:
                 sigma = 0.02
                 img1 = img1 + np.random.normal(0, sigma, img1.shape).astype(np.float32)
                 img2 = img2 + np.random.normal(0, sigma, img2.shape).astype(np.float32)
 
-        # ---- 4. resize to fixed trainsize ----
+        # resize
         img1_r = _resize_2d(img1, self.trainsize, 'bilinear')
         img2_r = _resize_2d(img2, self.trainsize, 'bilinear')
         msk_r  = _resize_2d(msk,  self.trainsize, 'nearest')
 
-        # ---- 5. to tensor, tile to 3 channels for the Res2Net backbone ----
         img1_t = torch.from_numpy(img1_r).float().unsqueeze(0).expand(3, -1, -1).contiguous()
         img2_t = torch.from_numpy(img2_r).float().unsqueeze(0).expand(3, -1, -1).contiguous()
         msk_t  = torch.from_numpy(msk_r).float().unsqueeze(0)
@@ -504,24 +457,32 @@ class MedicalSliceDataset(Dataset):
 # Test
 # --------------------------------------------------------------------------- #
 if __name__ == '__main__':
-    print('--- train (paired T1+T2, every slice, no filtering) ---')
-    ds = MedicalSliceDataset(root='./TrainDataset', split='train',
-                             trainsize=256, augment=True, crop_size=384)
-    print('Train samples:', len(ds))
-    sample = ds[0]
-    print('image_t1:', sample['image_t1'].shape, sample['image_t1'].dtype,
-          'min/max:', float(sample['image_t1'].min()), float(sample['image_t1'].max()))
-    print('image_t2:', sample['image_t2'].shape, sample['image_t2'].dtype,
-          'min/max:', float(sample['image_t2'].min()), float(sample['image_t2'].max()))
-    print('mask    :', sample['mask'].shape,  sample['mask'].dtype,
-          'pos_frac:', float(sample['mask'].mean()))
+    print('--- traindata / train (with crop) ---')
+    train_ds = MedicalSliceDataset(
+        root='./data/traindata', split='train',
+        trainsize=256, augment=True, crop_size=384,
+        train_ratio=0.8, val_ratio=0.2, test_ratio=0.0,
+    )
+    s = train_ds[0]
+    print('image_t1:', s['image_t1'].shape, s['image_t1'].dtype,
+          'min/max:', float(s['image_t1'].min()), float(s['image_t1'].max()))
+    print('image_t2:', s['image_t2'].shape, s['image_t2'].dtype,
+          'min/max:', float(s['image_t2'].min()), float(s['image_t2'].max()))
+    print('mask    :', s['mask'].shape,    s['mask'].dtype,
+          'pos_frac:', float(s['mask'].mean()))
 
-    print('\n--- val ---')
-    val_ds = MedicalSliceDataset(root='./TrainDataset', split='val',
-                                trainsize=256, augment=False)
-    print('Val samples:', len(val_ds))
+    print('\n--- traindata / val ---')
+    val_ds = MedicalSliceDataset(
+        root='./data/traindata', split='val',
+        trainsize=256, augment=False,
+        train_ratio=0.8, val_ratio=0.2, test_ratio=0.0,
+    )
+    print('val samples:', len(val_ds))
 
-    print('\n--- test ---')
-    test_ds = MedicalSliceDataset(root='./TrainDataset', split='test',
-                                 trainsize=256, augment=False)
-    print('Test samples:', len(test_ds))
+    print('\n--- testdata / test (resplit=False, all 30 patients) ---')
+    test_ds = MedicalSliceDataset(
+        root='./data/testdata', split='test',
+        trainsize=256, augment=False,
+        resplit=False,
+    )
+    print('test samples:', len(test_ds))
