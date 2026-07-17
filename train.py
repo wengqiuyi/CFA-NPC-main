@@ -211,19 +211,39 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
             w1, w2, w3, wm = deep_sup_w
             loss_total = w1*loss_sal1 + w2*loss_sal2 + w3*loss_sal3 + wm*loss_mask
 
+            # ---- NaN / inf guard: skip the optimizer step if loss blew up ----
+            if not torch.isfinite(loss_total):
+                print('[{}] => [WARN] non-finite loss at step {}, skipping update '
+                      '(sal1={:.3f} sal2={:.3f} sal3={:.3f} mask={:.3f})'.format(
+                          datetime.now(), step, float(loss_sal1), float(loss_sal2),
+                          float(loss_sal3), float(loss_mask)))
+                optimizer.zero_grad()
+                # don't apply gradients; just continue
+                if step % log_every == 0 or step == total_step:
+                    print('[{}] => [Epoch Num: {:03d}/{:03d}] => [Global Step: {:04d}/{:04d}] => [Loss_sal1: {:.4f} Loss_sal2: {:.4f} Loss_sal3: {:.4f} Loss_mask: {:.4f} Loss_total: {:.4f}]'.
+                          format(datetime.now(), epoch, opt.epoch, step, total_step,
+                                 loss_sal1.data, loss_sal2.data, loss_sal3.data,
+                                 loss_mask.data, loss_total.data))
+                continue
+
             loss_total.backward()
 
             # ---- gradient clipping (stability) ----
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-            # ---- warmup (linear over the first N steps) ----
+            # ---- warmup (linear over the first N global steps) ----
+            # IMPORTANT: multiply the *original* learning rate by warm
+            # each step.  Do NOT compound a `base_lr` across steps —
+            # the previous version used `base_lr = pg['lr'] / warm`
+            # and then `pg['lr'] = base_lr * warm`, which made the LR
+            # *quadratically* ramp up to 200x the configured value
+            # over 200 warmup steps.  That blew up to 1e-2 and
+            # produced the NaN that ended epoch 6.
             if opt.warmup_steps > 0:
                 warm = min(1.0, (step + 1) / max(1, opt.warmup_steps))
                 for pg in optimizer.param_groups:
-                    base_lr = pg.get('base_lr', pg['lr'] / max(warm, 1e-6))
-                    pg['base_lr'] = base_lr
-                    pg['lr'] = base_lr * warm
+                    pg['lr'] = opt.lr * warm
 
             optimizer.step()
 
