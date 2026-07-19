@@ -368,6 +368,9 @@ if __name__ == "__main__":
     parser.add_argument('--deep_sup_w',  type=str,   default='1,1,1,1',
                         help='Deep-supervision weights for (sal1, sal2, sal3, mask). '
                              'Comma-separated, e.g. "0.5,0.5,0.5,1.0".')
+    parser.add_argument('--log_every',   type=int,   default=10,
+                        help='Print the per-step loss every N global steps. '
+                             'Use 1 for maximum verbosity (e.g. when debugging crashes).')
 
     # ---- Pretrained-weight options ----
     parser.add_argument('--pretrain_ckpt', type=str, default='',
@@ -482,9 +485,11 @@ if __name__ == "__main__":
     assert len(deep_sup_w) == 4, f'--deep_sup_w must have 4 values, got {opt.deep_sup_w}'
 
     # ------------------ DataLoaders (NIfTI medical slices) ------------------ #
+    # num_workers=0 keeps the loader in the main process — simpler, and
+    # avoids the end-of-epoch worker-shutdown crashes we hit twice.
     train_loader = get_loader(opt.train_root, split='train',
                               batchsize=opt.batchsize, trainsize=opt.trainsize,
-                              num_workers=4, augment=True,
+                              num_workers=0, augment=True,
                               crop_size=opt.crop_size,
                               mask_combine=opt.mask_combine,
                               resplit=opt.resplit, seed=opt.resplit_seed,
@@ -493,7 +498,7 @@ if __name__ == "__main__":
                               test_ratio=opt.test_ratio)
     val_loader   = get_loader(opt.val_root, split='val',
                               batchsize=opt.batchsize, trainsize=opt.trainsize,
-                              num_workers=2, augment=False,
+                              num_workers=0, augment=False,
                               mask_combine=opt.mask_combine,
                               resplit=opt.resplit, seed=opt.resplit_seed,
                               train_ratio=opt.train_ratio,
@@ -501,7 +506,7 @@ if __name__ == "__main__":
                               test_ratio=opt.test_ratio)
     test_loader  = get_loader(opt.test_root, split='test',
                               batchsize=opt.batchsize, trainsize=opt.trainsize,
-                              num_workers=2, augment=False,
+                              num_workers=0, augment=False,
                               mask_combine=opt.mask_combine,
                               resplit=opt.resplit, seed=opt.resplit_seed,
                               train_ratio=opt.train_ratio,
@@ -514,10 +519,10 @@ if __name__ == "__main__":
                     "Training Save: {}\ntotal_num: {}\n".format(opt.train_root, opt.lr,
                                                               opt.batchsize, opt.save_model, total_step), '-' * 30)
 
-    for epoch_iter in range(1, opt.epoch):
-        
+    for epoch_iter in range(1, opt.epoch + 1):
+
         adjust_lr(optimizer, epoch_iter, opt.decay_rate, opt.decay_epoch)
-        
+
         train(train_loader, model, optimizer, epoch_iter, opt, loss_func, total_step,
               deep_sup_w=deep_sup_w, grad_clip=opt.grad_clip)
         #test(test_loader,   model, epoch_iter, opt.save_model)
