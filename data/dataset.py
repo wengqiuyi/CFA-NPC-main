@@ -127,44 +127,131 @@ def _zscore(arr, eps=1e-6):
     return (arr - mean) / std
 
 
-def _resize_2d(img, size, mode):
-    t = torch.from_numpy(img).float().unsqueeze(0).unsqueeze(0)
-    if mode == 'bilinear':
-        out = TF.interpolate(t, size=(size, size), mode='bilinear', align_corners=False)
+def _resize_2d(img, target_size, mode):
+    t = torch.from_numpy(img).float()
+    if img.ndim == 2:
+        t = t.unsqueeze(0).unsqueeze(0)
+    elif img.ndim == 3:
+        t = t.unsqueeze(0)
     else:
-        out = TF.interpolate(t, size=(size, size), mode='nearest')
-    return out.squeeze(0).squeeze(0).numpy()
+        raise ValueError(f'_resize_2d expects 2D or CHW array, got shape={img.shape}')
+    if mode == 'bilinear':
+        out = TF.interpolate(t, size=(target_size, target_size), mode='bilinear', align_corners=False)
+    else:
+        out = TF.interpolate(t, size=(target_size, target_size), mode='nearest')
+    out = out.squeeze(0).numpy()
+    return out[0] if img.ndim == 2 else out
 
 
-def _random_crop(img1, img2, msk, crop_h, crop_w):
+def _random_crop(img1, img2, msk, crop_h, crop_w, rng=None):
+    if rng is None:
+        rng = random
     H, W = img1.shape[-2:]
     pad_h = max(0, crop_h - H)
     pad_w = max(0, crop_w - W)
     if pad_h or pad_w:
-        img1 = np.pad(img1, ((0, pad_h), (0, pad_w)), mode='constant',
-                      constant_values=float(img1.mean()))
-        img2 = np.pad(img2, ((0, pad_h), (0, pad_w)), mode='constant',
-                      constant_values=float(img2.mean()))
+        if img1.ndim == 3:
+            img1 = np.pad(img1, ((0, 0), (0, pad_h), (0, pad_w)), mode='constant',
+                          constant_values=float(img1.mean()))
+            img2 = np.pad(img2, ((0, 0), (0, pad_h), (0, pad_w)), mode='constant',
+                          constant_values=float(img2.mean()))
+        else:
+            img1 = np.pad(img1, ((0, pad_h), (0, pad_w)), mode='constant',
+                          constant_values=float(img1.mean()))
+            img2 = np.pad(img2, ((0, pad_h), (0, pad_w)), mode='constant',
+                          constant_values=float(img2.mean()))
         msk = np.pad(msk, ((0, pad_h), (0, pad_w)), mode='constant',
                      constant_values=0.0)
-        H, W = img1.shape
-    top = random.randint(0, H - crop_h)
-    left = random.randint(0, W - crop_w)
-    return (img1[top:top + crop_h, left:left + crop_w].copy(),
-            img2[top:top + crop_h, left:left + crop_w].copy(),
+        H, W = img1.shape[-2:]
+    top = rng.randint(0, H - crop_h)
+    left = rng.randint(0, W - crop_w)
+    return (img1[..., top:top + crop_h, left:left + crop_w].copy(),
+            img2[..., top:top + crop_h, left:left + crop_w].copy(),
             msk[top:top + crop_h, left:left + crop_w].copy())
 
 
-def _gamma_jitter(arr, gamma_range=(0.7, 1.4), eps=1e-6):
-    g = random.uniform(*gamma_range)
+def _gamma_jitter(arr, gamma_range=(0.7, 1.4), eps=1e-6, rng=None):
+    if rng is None:
+        rng = random
+    if arr.ndim == 3:
+        return np.stack([_gamma_jitter(arr[i], gamma_range=gamma_range, eps=eps, rng=rng)
+                         for i in range(arr.shape[0])], axis=0)
+    # 保存原始统计信息以保持归一化一致性
+    original_mean = arr.mean()
+    original_std = arr.std() if arr.std() > eps else eps
+    
+    g = rng.uniform(*gamma_range)
     a = arr - arr.min() + eps
     a = a / (a.max() + eps)
     a = np.power(a, 1.0 / g)
-    return (a - a.mean()) / (a.std() + eps)
+    
+    # 恢复原始归一化
+    a = (a - a.mean()) / (a.std() + eps)
+    return a * original_std + original_mean
 
 
-def _brightness_contrast(arr, b_range=(-0.1, 0.1), c_range=(0.8, 1.2)):
-    return arr * random.uniform(*c_range) + random.uniform(*b_range)
+def _brightness_contrast(arr, b_range=(-0.1, 0.1), c_range=(0.8, 1.2), rng=None):
+    if rng is None:
+        rng = random
+    if arr.ndim == 3:
+        return np.stack([_brightness_contrast(arr[i], b_range=b_range, c_range=c_range, rng=rng)
+                         for i in range(arr.shape[0])], axis=0)
+    # 亮度/对比度调整，添加范围限制
+    c = rng.uniform(*c_range)
+    b = rng.uniform(*b_range)
+    # 限制输出范围在合理的 Z-score 范围内 (-5, 5)
+    return np.clip(arr * c + b, -5.0, 5.0)
+
+
+def _check_and_fix(arr, name='array'):
+    """检查并修复 NaN 和 Inf 值"""
+    if arr is None:
+        return arr
+    arr = arr.astype(np.float32)
+    # 检查和替换 NaN 和 Inf
+    nan_mask = np.isnan(arr)
+    inf_mask = np.isinf(arr)
+    if np.any(nan_mask) or np.any(inf_mask):
+        print(f'[WARN] {name} contains NaN/Inf, fixing...')
+        # 用均值填充 NaN，用边界值填充 Inf
+        finite_mask = np.isfinite(arr)
+        if np.any(finite_mask):
+            mean_val = np.mean(arr[finite_mask])
+            min_val = np.min(arr[finite_mask])
+            max_val = np.max(arr[finite_mask])
+            arr[nan_mask] = mean_val
+            arr[np.isposinf(arr)] = max_val
+            arr[np.isneginf(arr)] = min_val
+        else:
+            arr[:] = 0.0
+    return arr
+
+
+def _normalize_slice_stack(arr, name='stack'):
+    """Apply percentile clip + z-score slice-wise for a 2.5D stack."""
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    out = []
+    for i in range(arr.shape[0]):
+        ch = _check_and_fix(arr[i], f'{name}_slice{i}')
+        ch = _percentile_clip(ch)
+        ch = _zscore(ch)
+        out.append(ch.astype(np.float32))
+    return np.stack(out, axis=0)
+
+
+def _stack_neighbor_slices(vol, s):
+    """Return a 3-slice stack [s-1, s, s+1] with edge replication."""
+    if vol is None:
+        return None
+    if vol.ndim == 2:
+        base = vol.astype(np.float32)
+        return np.stack([base, base, base], axis=0)
+    D = vol.shape[0]
+    idxs = [max(0, min(D - 1, s - 1)),
+            max(0, min(D - 1, s)),
+            max(0, min(D - 1, s + 1))]
+    return np.stack([vol[i].astype(np.float32) for i in idxs], axis=0)
 
 
 def _combine_masks(t1_m, t2_m, mode):
@@ -229,6 +316,7 @@ class MedicalSliceDataset(Dataset):
         self.resplit      = resplit
         self.seed         = seed
         self.require_pair = require_pair
+        self._rng         = None
 
         # --------------------------------------------------------------
         # 1) enumerate patients, pair (T1 img, T1 msk) and (T2 img, T2 msk)
@@ -251,8 +339,8 @@ class MedicalSliceDataset(Dataset):
                 n_skip_dir += 1
                 continue
 
-            t1_files = [(f, f.stem) for f in t1d.iterdir() if f.suffix == '.gz']
-            t2_files = [(f, f.stem) for f in t2d.iterdir() if f.suffix == '.gz']
+            t1_files = [(f, f.stem) for f in t1d.iterdir() if f.name.endswith('.nii.gz')]
+            t2_files = [(f, f.stem) for f in t2d.iterdir() if f.name.endswith('.nii.gz')]
 
             t1_pairs = _pair_with_suffix(t1_files)   # suffix -> (img, msk)
             t2_pairs = _pair_with_suffix(t2_files)
@@ -380,6 +468,18 @@ class MedicalSliceDataset(Dataset):
               f'{extra}')
 
     # ------------------------------------------------------------------ #
+    def _get_rng(self):
+        if self._rng is None:
+            try:
+                from torch.utils.data import get_worker_info
+                wi = get_worker_info()
+                wid = wi.id if wi is not None else 0
+            except Exception:
+                wid = 0
+            self._rng = random.Random(int(self.seed) + int(wid) * 10007)
+        return self._rng
+
+    # ------------------------------------------------------------------ #
     def __len__(self):
         return len(self.samples)
 
@@ -398,51 +498,58 @@ class MedicalSliceDataset(Dataset):
             D = arr.shape[0]
             return arr[min(s, D - 1)]
 
-        img1 = _slice(t1_vol, s)
-        img2 = _slice(t2_vol, s)
+        img1 = _stack_neighbor_slices(t1_vol, s)
+        img2 = _stack_neighbor_slices(t2_vol, s)
         msk1 = _slice(t1m_vol, s)
         msk2 = _slice(t2m_vol, s)
 
-        # per-modality normalisation
-        img1 = _percentile_clip(img1); img1 = _zscore(img1)
-        img2 = _percentile_clip(img2); img2 = _zscore(img2)
-        msk  = _combine_masks(msk1 if msk1 is not None else np.zeros_like(img1),
-                              msk2 if msk2 is not None else np.zeros_like(img2),
+        # 检查并修复 NaN/Inf 值
+        msk1 = _check_and_fix(msk1, 't1_mask')
+        msk2 = _check_and_fix(msk2, 't2_mask')
+
+        # per-modality 2.5D normalisation (slice-wise)
+        img1 = _normalize_slice_stack(img1, 't1_img')
+        img2 = _normalize_slice_stack(img2, 't2_img')
+        zero_mask = np.zeros_like(img1[0], dtype=np.float32)
+        msk  = _combine_masks(msk1 if msk1 is not None else zero_mask,
+                              msk2 if msk2 is not None else zero_mask,
                               self.mask_combine)
 
         # augment
         if self.augment and self.split == 'train':
-            if self.crop_size > 0 and (img1.shape[0] >= self.crop_size and
-                                       img1.shape[1] >= self.crop_size):
+            rng = self._get_rng()
+            if self.crop_size > 0:
                 img1, img2, msk = _random_crop(img1, img2, msk,
-                                               self.crop_size, self.crop_size)
-            if random.random() < 0.5:
-                img1 = img1[:, ::-1].copy(); img2 = img2[:, ::-1].copy(); msk = msk[:, ::-1].copy()
-            if random.random() < 0.5:
-                img1 = img1[::-1, :].copy(); img2 = img2[::-1, :].copy(); msk = msk[::-1, :].copy()
-            k = random.randint(0, 3)
+                                               self.crop_size, self.crop_size, rng)
+            if rng.random() < 0.5:
+                img1 = img1[:, :, ::-1].copy(); img2 = img2[:, :, ::-1].copy(); msk = msk[:, ::-1].copy()
+            if rng.random() < 0.5:
+                img1 = img1[:, ::-1, :].copy(); img2 = img2[:, ::-1, :].copy(); msk = msk[::-1, :].copy()
+            k = rng.randint(0, 3)
             if k:
-                img1 = np.rot90(img1, k=k).copy()
-                img2 = np.rot90(img2, k=k).copy()
+                img1 = np.rot90(img1, k=k, axes=(-2, -1)).copy()
+                img2 = np.rot90(img2, k=k, axes=(-2, -1)).copy()
                 msk  = np.rot90(msk,  k=k).copy()
             # intensity augmentations — reduced probability (was 0.5/0.5/0.2)
             # to prevent per-batch loss spikes
-            if random.random() < 0.30: img1 = _gamma_jitter(img1)
-            if random.random() < 0.30: img2 = _gamma_jitter(img2)
-            if random.random() < 0.30: img1 = _brightness_contrast(img1)
-            if random.random() < 0.30: img2 = _brightness_contrast(img2)
-            if random.random() < 0.10:
+            if rng.random() < 0.30: img1 = _gamma_jitter(img1, rng=rng)
+            if rng.random() < 0.30: img2 = _gamma_jitter(img2, rng=rng)
+            if rng.random() < 0.30: img1 = _brightness_contrast(img1, rng=rng)
+            if rng.random() < 0.30: img2 = _brightness_contrast(img2, rng=rng)
+            if rng.random() < 0.10:
                 sigma = 0.02
-                img1 = img1 + np.random.normal(0, sigma, img1.shape).astype(np.float32)
-                img2 = img2 + np.random.normal(0, sigma, img2.shape).astype(np.float32)
+                # 使用 numpy 随机数生成器，使其可复现
+                np_rng = np.random.RandomState(rng.getrandbits(32))
+                img1 = img1 + np_rng.normal(0, sigma, img1.shape).astype(np.float32)
+                img2 = img2 + np_rng.normal(0, sigma, img2.shape).astype(np.float32)
 
         # resize
         img1_r = _resize_2d(img1, self.trainsize, 'bilinear')
         img2_r = _resize_2d(img2, self.trainsize, 'bilinear')
         msk_r  = _resize_2d(msk,  self.trainsize, 'nearest')
 
-        img1_t = torch.from_numpy(img1_r).float().unsqueeze(0).expand(3, -1, -1).contiguous()
-        img2_t = torch.from_numpy(img2_r).float().unsqueeze(0).expand(3, -1, -1).contiguous()
+        img1_t = torch.from_numpy(img1_r).float().contiguous()
+        img2_t = torch.from_numpy(img2_r).float().contiguous()
         msk_t  = torch.from_numpy(msk_r).float().unsqueeze(0)
 
         return {
@@ -454,35 +561,122 @@ class MedicalSliceDataset(Dataset):
 
 
 # --------------------------------------------------------------------------- #
+# Save Preprocessed Data
+# --------------------------------------------------------------------------- #
+def save_preprocessed_dataset(dataset, save_dir):
+    """
+    Save preprocessed dataset to disk
+    
+    Args:
+        dataset: MedicalSliceDataset instance
+        save_dir: Directory to save the data
+    """
+    import numpy as np
+    from pathlib import Path
+    
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    
+    # Create subdirectories
+    t1_dir = save_path / 'images_t1'
+    t2_dir = save_path / 'images_t2'
+    mask_dir = save_path / 'masks'
+    
+    t1_dir.mkdir(exist_ok=True)
+    t2_dir.mkdir(exist_ok=True)
+    mask_dir.mkdir(exist_ok=True)
+    
+    print(f'Saving {len(dataset)} samples to {save_path}...')
+    
+    # Save each sample
+    for idx in range(len(dataset)):
+        sample = dataset[idx]
+        filename = f'sample_{idx:06d}'
+        
+        # Save as numpy arrays
+        np.save(t1_dir / f'{filename}.npy', sample['image_t1'].numpy())
+        np.save(t2_dir / f'{filename}.npy', sample['image_t2'].numpy())
+        np.save(mask_dir / f'{filename}.npy', sample['mask'].numpy())
+        
+        if (idx + 1) % 50 == 0:
+            print(f'  Saved {idx + 1}/{len(dataset)}')
+    
+    print(f'Successfully saved {len(dataset)} samples!')
+
+
+# --------------------------------------------------------------------------- #
 # Test
 # --------------------------------------------------------------------------- #
 if __name__ == '__main__':
-    print('--- traindata / train (with crop) ---')
-    train_ds = MedicalSliceDataset(
-        root='./data/traindata', split='train',
-        trainsize=256, augment=True, crop_size=384,
-        train_ratio=0.8, val_ratio=0.2, test_ratio=0.0,
-    )
-    s = train_ds[0]
-    print('image_t1:', s['image_t1'].shape, s['image_t1'].dtype,
-          'min/max:', float(s['image_t1'].min()), float(s['image_t1'].max()))
-    print('image_t2:', s['image_t2'].shape, s['image_t2'].dtype,
-          'min/max:', float(s['image_t2'].min()), float(s['image_t2'].max()))
-    print('mask    :', s['mask'].shape,    s['mask'].dtype,
-          'pos_frac:', float(s['mask'].mean()))
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == 'save':
+        # Save preprocessed data mode
+        print('='*60)
+        print('Saving Preprocessed Datasets')
+        print('='*60)
+        
+        # Process and save train dataset
+        print('\n--- Training Dataset ---')
+        train_ds = MedicalSliceDataset(
+            root='/root/CFANet-main/data/traindata', split='train',
+            trainsize=256, augment=False, crop_size=0,
+            resplit=True, seed=42,
+            train_ratio=0.8, val_ratio=0.2, test_ratio=0.0,
+        )
+        save_preprocessed_dataset(train_ds, '/root/CFANet-main/TrainDataset/train')
+        
+        # Process and save val dataset
+        print('\n--- Validation Dataset ---')
+        val_ds = MedicalSliceDataset(
+            root='/root/CFANet-main/data/traindata', split='val',
+            trainsize=256, augment=False, crop_size=0,
+            resplit=True, seed=42,
+            train_ratio=0.8, val_ratio=0.2, test_ratio=0.0,
+        )
+        save_preprocessed_dataset(val_ds, '/root/CFANet-main/TrainDataset/val')
+        
+        # Process and save test dataset
+        print('\n--- Test Dataset ---')
+        test_ds = MedicalSliceDataset(
+            root='/root/CFANet-main/data/testdata', split='test',
+            trainsize=256, augment=False, crop_size=0,
+            resplit=False,
+        )
+        save_preprocessed_dataset(test_ds, '/root/CFANet-main/TestDataset/test')
+        
+        print('\n' + '='*60)
+        print('All datasets saved successfully!')
+        print('='*60)
+        
+    else:
+        # Original test mode
+        print('--- traindata / train (with crop) ---')
+        train_ds = MedicalSliceDataset(
+            root='./data/traindata', split='train',
+            trainsize=256, augment=True, crop_size=384,
+            train_ratio=0.8, val_ratio=0.2, test_ratio=0.0,
+        )
+        s = train_ds[0]
+        print('image_t1:', s['image_t1'].shape, s['image_t1'].dtype,
+              'min/max:', float(s['image_t1'].min()), float(s['image_t1'].max()))
+        print('image_t2:', s['image_t2'].shape, s['image_t2'].dtype,
+              'min/max:', float(s['image_t2'].min()), float(s['image_t2'].max()))
+        print('mask    :', s['mask'].shape,    s['mask'].dtype,
+              'pos_frac:', float(s['mask'].mean()))
 
-    print('\n--- traindata / val ---')
-    val_ds = MedicalSliceDataset(
-        root='./data/traindata', split='val',
-        trainsize=256, augment=False,
-        train_ratio=0.8, val_ratio=0.2, test_ratio=0.0,
-    )
-    print('val samples:', len(val_ds))
+        print('\n--- traindata / val ---')
+        val_ds = MedicalSliceDataset(
+            root='./data/traindata', split='val',
+            trainsize=256, augment=False,
+            train_ratio=0.8, val_ratio=0.2, test_ratio=0.0,
+        )
+        print('val samples:', len(val_ds))
 
-    print('\n--- testdata / test (resplit=False, all 30 patients) ---')
-    test_ds = MedicalSliceDataset(
-        root='./data/testdata', split='test',
-        trainsize=256, augment=False,
-        resplit=False,
-    )
-    print('test samples:', len(test_ds))
+        print('\n--- testdata / test (resplit=False, all 30 patients) ---')
+        test_ds = MedicalSliceDataset(
+            root='./data/testdata', split='test',
+            trainsize=256, augment=False,
+            resplit=False,
+        )
+        print('test samples:', len(test_ds))

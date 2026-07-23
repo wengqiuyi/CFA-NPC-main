@@ -43,5 +43,6 @@ def clip_gradient(optimizer, grad_clip):
 def adjust_lr(optimizer, epoch, decay_rate=0.1, decay_epoch=30):
     decay = decay_rate ** (epoch // decay_epoch)
     for param_group in optimizer.param_groups:
-        param_group['lr'] *= decay
-
+        if 'initial_lr' not in param_group:
+            param_group['initial_lr'] = param_group['lr']
+        param_group['lr'] = param_group['initial_lr'] * decay

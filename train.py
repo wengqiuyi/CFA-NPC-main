@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import argparse
 
 from lib.model import CFANet
@@ -14,6 +14,8 @@ import logging
 
 best_mae   = 1
 best_epoch = 0
+best_val_fg_dice = -1.0
+best_val_fg_epoch = 0
 
 
 def structure_loss(pred, mask):
@@ -94,9 +96,9 @@ def boundary_aware_bce(pred, mask, k=15):
 
 
 def small_target_loss(pred, mask,
-                      w_ft=1.5, w_bce=0.3, w_dice=0.5,
-                      ft_alpha=0.7, ft_beta=0.3, ft_gamma=0.75,
-                      boundary_k=15):
+                      w_ft=2.0, w_bce=0.15, w_dice=0.5,
+                      ft_alpha=0.3, ft_beta=0.7, ft_gamma=1.0,
+                      boundary_k=5):
     """
     Combined loss for small-object binary segmentation.
 
@@ -107,19 +109,54 @@ def small_target_loss(pred, mask,
     Args:
         pred, mask : logits / binary mask  (B, 1, H, W)
         w_ft       : weight of Focal-Tversky (region-level, small-target).
-                     Default 1.5 (was 1.0) — this is the dominant signal
-                     for ~0.4% positive-pixel ratio.
-        w_bce      : weight of boundary-aware BCE.  Default 0.3 (was 0.5)
-                     — pure BCE drowns the signal in negative pixels for
-                     very small targets.
+                     Default 2.0 — dominant term for extremely small targets.
+        w_bce      : weight of boundary-aware BCE.  Default 0.15
+                     so the many negative slices do not overpower the lesion signal.
         w_dice     : weight of Dice (overlap, imbalance-robust).
-        boundary_k : half-width of the boundary band.  15 is too wide for
-                     256x256 inputs; 7 keeps the band tight on the lesion
-                     edges and lets the gradient concentrate there.
+        boundary_k : half-width of the boundary band.  5 keeps the band tight
+                     on tiny lesions in 256x256 inputs.
     """
     return (w_ft   * focal_tversky_loss(pred, mask, ft_alpha, ft_beta, ft_gamma)
           + w_bce  * boundary_aware_bce (pred, mask, boundary_k)
           + w_dice * dice_loss           (pred, mask))
+
+
+def unwrap_state_dict(ckpt):
+    """Unwrap common checkpoint wrappers and return a plain state_dict."""
+    if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+        return ckpt['state_dict']
+    if isinstance(ckpt, dict) and 'model' in ckpt:
+        return ckpt['model']
+    return ckpt
+
+
+def looks_like_single_res2net_backbone(state_dict):
+    """
+    Official Res2Net backbone weights use keys like:
+        conv1.0.weight, bn1.weight, layer1.0.conv1.weight
+    rather than backbone_t1./backbone_t2. prefixes.
+    """
+    if not isinstance(state_dict, dict) or not state_dict:
+        return False
+    sample_keys = list(state_dict.keys())[:20]
+    return (not any(k.startswith('backbone_t1.') or k.startswith('backbone_t2.')
+                    for k in sample_keys)
+            and any(k.startswith('conv1.') or k.startswith('bn1.') or k.startswith('layer1.')
+                    for k in sample_keys))
+
+
+def map_single_backbone_to_dual_backbone(state_dict, model_dict):
+    """
+    Copy one official Res2Net backbone state_dict into both encoder branches:
+        conv1.0.weight -> backbone_t1.conv1.0.weight / backbone_t2.conv1.0.weight
+    """
+    mapped = {}
+    for prefix in ('backbone_t1.', 'backbone_t2.'):
+        for k, v in state_dict.items():
+            mk = prefix + k
+            if mk in model_dict and hasattr(v, 'shape') and v.shape == model_dict[mk].shape:
+                mapped[mk] = v
+    return mapped
 
 
 # --------------------------------------------------------------------------- #
@@ -129,20 +166,36 @@ def get_loader(root, split, batchsize, trainsize, num_workers=4,
                augment=True, shuffle=None,
                crop_size=0, mask_combine='or',
                resplit=True, seed=42,
-               train_ratio=0.8, val_ratio=0.2, test_ratio=0.0):
+               train_ratio=0.8, val_ratio=0.2, test_ratio=0.0,
+               data_format='npy',
+               pos_sample_weight=1.0):
     """
-    Build a torch.utils.data.DataLoader for the per-patient NIfTI
-    medical-slice dataset.
+    Build a torch.utils.data.DataLoader.
 
-    Every sample is a *paired* (image_t1, image_t2, mask) — the two
-    modalities of the same patient's same slice.  When ``resplit`` is
-    True, the patients under ``root`` are deterministically shuffled
-    and split into train/val/test by patient; when False, every
-    patient in ``root`` is yielded regardless of the split name.
+    Supported formats
+    -----------------
+    npy   : preprocessed slices saved under TrainDataset/TestDataset
+    nifti : online 3-D NIfTI -> 2-D slicing pipeline from data/dataset.py
     """
-    from data.dataset import MedicalSliceDataset
     if shuffle is None:
         shuffle = (split == 'train')
+
+    if data_format == 'npy':
+        from preprocessed_dataset import PreprocessedDataset
+        ds = PreprocessedDataset(root, split=split)
+        sampler = None
+        if split == 'train' and pos_sample_weight > 1.0:
+            weights = ds.build_sample_weights(pos_sample_weight)
+            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            shuffle = False
+        return DataLoader(ds, batch_size=batchsize, shuffle=shuffle,
+                          sampler=sampler, num_workers=num_workers, pin_memory=True,
+                          drop_last=(split == 'train'))
+
+    if data_format != 'nifti':
+        raise ValueError(f'Unknown --data_format: {data_format}')
+
+    from data.dataset import MedicalSliceDataset
     # resplit only makes sense on the training root; the test root is
     # the held-out set so we want every patient yielded.
     use_resplit = resplit and (split != 'test')
@@ -154,8 +207,15 @@ def get_loader(root, split, batchsize, trainsize, num_workers=4,
                              train_ratio=train_ratio,
                              val_ratio=val_ratio,
                              test_ratio=test_ratio)
+    sampler = None
+    if split == 'train' and pos_sample_weight > 1.0 and hasattr(ds, 'samples'):
+        weights = [float(pos_sample_weight) if bool(s[5]) else 1.0 for s in ds.samples]
+        sampler = WeightedRandomSampler(torch.tensor(weights, dtype=torch.double),
+                                        num_samples=len(weights), replacement=True)
+        shuffle = False
     return DataLoader(ds, batch_size=batchsize, shuffle=shuffle,
-                      num_workers=num_workers, pin_memory=True, drop_last=(split == 'train'))
+                      sampler=sampler, num_workers=num_workers,
+                      pin_memory=True, drop_last=(split == 'train'))
 
 
 def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
@@ -177,13 +237,19 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
 
     # multi-scale controlled by CLI; default is single-scale for stability
     size_rates = [float(r) for r in opt.size_rates.split(',')] if opt.size_rates else [1.0]
+    epoch_lrs = [pg['lr'] for pg in optimizer.param_groups]
+    device = next(model.parameters()).device
 
     for step, batch in enumerate(train_loader):
 
         # ---- unpack batch (paired T1+T2 only) ----
-        images_t1 = batch['image_t1'].cuda()
-        images_t2 = batch['image_t2'].cuda()
-        gts       = batch['mask'].cuda()
+        images_t1 = batch['image_t1'].to(device, non_blocking=True)
+        images_t2 = batch['image_t2'].to(device, non_blocking=True)
+        gts       = batch['mask'].to(device, non_blocking=True)
+
+        images_t1_0 = images_t1
+        images_t2_0 = images_t2
+        gts_0 = gts
 
         for rate in size_rates:
 
@@ -192,12 +258,16 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
             # ---- rescale ----
             trainsize = int(round(opt.trainsize*rate/32)*32)
             if rate != 1:
-                images_t1 = F.interpolate(images_t1, size=(trainsize, trainsize),
-                                          mode='bilinear', align_corners=True)
-                images_t2 = F.interpolate(images_t2, size=(trainsize, trainsize),
-                                          mode='bilinear', align_corners=True)
-                gts       = F.interpolate(gts, size=(trainsize, trainsize),
-                                          mode='bilinear', align_corners=True)
+                images_t1 = F.interpolate(images_t1_0, size=(trainsize, trainsize),
+                                          mode='bilinear', align_corners=False)
+                images_t2 = F.interpolate(images_t2_0, size=(trainsize, trainsize),
+                                          mode='bilinear', align_corners=False)
+                gts       = F.interpolate(gts_0, size=(trainsize, trainsize),
+                                          mode='nearest')
+            else:
+                images_t1 = images_t1_0
+                images_t2 = images_t2_0
+                gts = gts_0
 
             # ---- forward ----
             sal_out1, sal_out2, sal_out3, mask = model(images_t1, images_t2)
@@ -242,8 +312,8 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
             # produced the NaN that ended epoch 6.
             if opt.warmup_steps > 0:
                 warm = min(1.0, (step + 1) / max(1, opt.warmup_steps))
-                for pg in optimizer.param_groups:
-                    pg['lr'] = opt.lr * warm
+                for i, pg in enumerate(optimizer.param_groups):
+                    pg['lr'] = epoch_lrs[i] * warm
 
             optimizer.step()
 
@@ -256,41 +326,92 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
 
 
     if (epoch) % opt.save_epoch == 0:
-        torch.save(model.state_dict(), save_path + 'CODNet_%d.pth' % (epoch))
+        torch.save(model.state_dict(), os.path.join(opt.save_model, 'CODNet_%d.pth' % (epoch)))
         
         
-def test(test_loader,model,epoch,save_path):
-    
-    global best_mae,best_epoch
+def eval_val_foreground_dice(val_loader, model, threshold=0.5, eps=1e-7):
     model.eval()
-    
+    device = next(model.parameters()).device
+    fg = []
+    all_d = []
     with torch.no_grad():
-        mae_sum=0
-        for i in range(test_loader.size):
-            image, gt, name = test_loader.load_data()
-            gt = np.asarray(gt, np.float32)
-            
-            gt /= (gt.max() + 1e-8)
-            
-            image = image.cuda()
+        for batch in val_loader:
+            x1 = batch['image_t1'].to(device, non_blocking=True)
+            x2 = batch['image_t2'].to(device, non_blocking=True)
+            gt = batch['mask'].to(device, non_blocking=True)
 
-            _,_,_,res = model(image)
-            res = F.interpolate(res, size=gt.shape, mode='bilinear', align_corners=False)
-            res = res.sigmoid().data.cpu().numpy().squeeze()
-            res = (res - res.min()) / (res.max() - res.min() + 1e-8)
-            mae_sum +=np.sum(np.abs(res-gt))*1.0/(gt.shape[0]*gt.shape[1])
-            
-        mae = mae_sum / test_loader.size
-      
-        print('Epoch: {} MAE: {} ####  bestMAE: {} bestEpoch: {}'.format(epoch,mae,best_mae,best_epoch))
+            s1, s2, s3, sm = model(x1, x2)
+            probs = (torch.sigmoid(s1) + torch.sigmoid(s2) +
+                     torch.sigmoid(s3) + torch.sigmoid(sm)) / 4.0
+            pred = (probs >= threshold).to(gt.dtype)
+            gt_b = (gt >= 0.5).to(gt.dtype)
+
+            pred_f = pred.flatten(1)
+            gt_f = gt_b.flatten(1)
+            tp = (pred_f * gt_f).sum(dim=1)
+            fp = (pred_f * (1 - gt_f)).sum(dim=1)
+            fn = ((1 - pred_f) * gt_f).sum(dim=1)
+            dice = (2 * tp) / (2 * tp + fp + fn + eps)
+
+            all_d.extend(dice.detach().cpu().tolist())
+            has_fg = (gt_f.sum(dim=1) > 0)
+            if has_fg.any():
+                fg.extend(dice[has_fg].detach().cpu().tolist())
+
+    model.train()
+    fg_mean = float(sum(fg) / max(1, len(fg)))
+    all_mean = float(sum(all_d) / max(1, len(all_d)))
+    return fg_mean, all_mean, int(len(fg)), int(len(all_d))
+
+
+def test(test_loader, model, epoch, save_path):
+    global best_mae, best_epoch
+    model.eval()
+
+    with torch.no_grad():
+        mae_sum = 0.0
+        n = 0
+
+        if hasattr(test_loader, 'size') and hasattr(test_loader, 'load_data'):
+            for _ in range(test_loader.size):
+                image, gt, _name = test_loader.load_data()
+                gt = np.asarray(gt, np.float32)
+                gt /= (gt.max() + 1e-8)
+
+                image = image.cuda()
+                _, _, _, res = model(image)
+                res = F.interpolate(res, size=gt.shape, mode='bilinear', align_corners=False)
+                res = res.sigmoid().data.cpu().numpy().squeeze()
+                res = (res - res.min()) / (res.max() - res.min() + 1e-8)
+                mae_sum += float(np.mean(np.abs(res - gt)))
+                n += 1
+        else:
+            device = next(model.parameters()).device
+            for batch in test_loader:
+                x1 = batch['image_t1'].to(device, non_blocking=True)
+                x2 = batch['image_t2'].to(device, non_blocking=True)
+                gt = batch['mask'].to(device, non_blocking=True)
+
+                s1, s2, s3, sm = model(x1, x2)
+                probs = (torch.sigmoid(s1) + torch.sigmoid(s2) +
+                         torch.sigmoid(s3) + torch.sigmoid(sm)) / 4.0
+
+                if probs.shape[-2:] != gt.shape[-2:]:
+                    probs = F.interpolate(probs, size=gt.shape[-2:], mode='bilinear', align_corners=False)
+
+                mae_sum += float(torch.abs(probs - gt).mean().item()) * probs.shape[0]
+                n += int(probs.shape[0])
+
+        mae = mae_sum / max(1, n)
+
+        print('Epoch: {} MAE: {} ####  bestMAE: {} bestEpoch: {}'.format(epoch, mae, best_mae, best_epoch))
         if epoch == 1:
             best_mae = mae
         else:
             if mae < best_mae:
-                best_mae   = mae
+                best_mae = mae
                 best_epoch = epoch
-                
-                torch.save(model.state_dict(), save_path+'/Cod_best.pth')
+                torch.save(model.state_dict(), os.path.join(save_path, 'Cod_best.pth'))
                 print('best epoch:{}'.format(epoch))
                 
        
@@ -308,18 +429,26 @@ if __name__ == "__main__":
     parser.add_argument('--gpu',         type=int,   default=0,    help='choose which gpu you use')
     parser.add_argument('--save_epoch',  type=int,   default=5,    help='every N epochs save your trained snapshot')
     parser.add_argument('--save_model',  type=str,   default='./Snapshot/CFANet/')
+    parser.add_argument('--val_eval_interval', type=int, default=5,
+                        help='Evaluate on val every N epochs. 0 disables.')
+    parser.add_argument('--val_threshold', type=float, default=0.5,
+                        help='Binarization threshold for val evaluation.')
     
     
-    parser.add_argument('--train_root',   type=str, default='./data/traindata',
-                        help='Path to the train-data root (per-patient directory).')
-    parser.add_argument('--val_root',     type=str, default='./data/traindata',
-                        help='Path to the val-data root.  Defaults to traindata — '
-                             'the val split is carved out of traindata by the '
-                             'deterministic re-split.  Override only if you have a '
-                             'dedicated val/ directory.')
-    parser.add_argument('--test_root',    type=str, default='./data/testdata',
-                        help='Path to the test-data root.  This is the held-out '
-                             'test set; resplit is automatically disabled.')
+    parser.add_argument('--data_format',  type=str, default='npy',
+                        choices=['npy', 'nifti'],
+                        help='Training data source. "npy" reads preprocessed '
+                             'TrainDataset/TestDataset slices, "nifti" uses the '
+                             'online MedicalSliceDataset pipeline.')
+    parser.add_argument('--train_root',   type=str, default='./TrainDataset',
+                        help='Path to the training data root. For --data_format=npy, '
+                             'this should contain ./train and ./val subfolders.')
+    parser.add_argument('--val_root',     type=str, default='./TrainDataset',
+                        help='Path to the validation data root. For --data_format=npy, '
+                             'reuse ./TrainDataset so split="val" loads val/.')
+    parser.add_argument('--test_root',    type=str, default='./TestDataset',
+                        help='Path to the test data root. For --data_format=npy, '
+                             'this should contain ./test subfolder.')
 
     # ---- DataLoader / augmentation options for the slice-level pipeline ----
     # NOTE: every slice of every split is yielded (no empty-mask filtering).
@@ -347,17 +476,21 @@ if __name__ == "__main__":
                              'The held-out test set comes from --test_root.')
 
     # ---- Loss / stability knobs (used to fix per-batch loss variance) ----
-    parser.add_argument('--w_ft',        type=float, default=1.5,
+    parser.add_argument('--w_ft',        type=float, default=2.0,
                         help='Weight of Focal-Tversky (small-target friendly).')
-    parser.add_argument('--w_bce',       type=float, default=0.3,
-                        help='Weight of boundary-aware BCE.')
+    parser.add_argument('--w_bce',       type=float, default=0.15,
+                        help='Weight of boundary-aware BCE. Use smaller values when empty slices dominate.')
     parser.add_argument('--w_dice',      type=float, default=0.5,
                         help='Weight of Dice.')
-    parser.add_argument('--ft_gamma',    type=float, default=0.75,
-                        help='Focusing exponent for Focal-Tversky (>=1 sharpens on hard pixels).')
-    parser.add_argument('--boundary_k',  type=int,   default=7,
+    parser.add_argument('--ft_alpha',    type=float, default=0.3,
+                        help='Focal-Tversky FP weight. Smaller values are more tolerant to false positives.')
+    parser.add_argument('--ft_beta',     type=float, default=0.7,
+                        help='Focal-Tversky FN weight. Larger values reduce missed tiny lesions.')
+    parser.add_argument('--ft_gamma',    type=float, default=1.0,
+                        help='Focusing exponent for Focal-Tversky. 1.0 is a good starting point for tiny targets.')
+    parser.add_argument('--boundary_k',  type=int,   default=5,
                         help='Half-width of the boundary band for boundary-aware BCE. '
-                             '15 was too wide for 256x256 small targets.')
+                             '5 keeps the boundary focus tighter for tiny targets.')
     parser.add_argument('--size_rates',  type=str,   default='1',
                         help='Comma-separated multi-scale rates (e.g. "0.75,1,1.25"). '
                              'Default single-scale "1" to keep loss stable on tiny targets.')
@@ -365,9 +498,12 @@ if __name__ == "__main__":
                         help='Max gradient norm.  0 disables clipping.')
     parser.add_argument('--warmup_steps', type=int,  default=200,
                         help='Linear LR warmup over the first N global steps.  0 disables.')
-    parser.add_argument('--deep_sup_w',  type=str,   default='1,1,1,1',
+    parser.add_argument('--deep_sup_w',  type=str,   default='0.5,0.75,0.75,1.0',
                         help='Deep-supervision weights for (sal1, sal2, sal3, mask). '
                              'Comma-separated, e.g. "0.5,0.5,0.5,1.0".')
+    parser.add_argument('--pos_sample_weight', type=float, default=3.0,
+                        help='Oversampling weight for positive slices in the training loader. '
+                             '1.0 disables oversampling.')
     parser.add_argument('--log_every',   type=int,   default=10,
                         help='Print the per-step loss every N global steps. '
                              'Use 1 for maximum verbosity (e.g. when debugging crashes).')
@@ -430,24 +566,27 @@ if __name__ == "__main__":
     if opt.pretrain_ckpt and os.path.isfile(opt.pretrain_ckpt):
         print('Loading pretrained weights from {}'.format(opt.pretrain_ckpt))
         ckpt = torch.load(opt.pretrain_ckpt, map_location='cuda:{}'.format(opt.gpu))
-
-        # If checkpoint is a dict with 'state_dict' or 'model' wrapper, unwrap it
-        if isinstance(ckpt, dict) and 'state_dict' in ckpt:
-            ckpt = ckpt['state_dict']
-        elif isinstance(ckpt, dict) and 'model' in ckpt:
-            ckpt = ckpt['model']
+        ckpt = unwrap_state_dict(ckpt)
 
         model_dict = model.state_dict()
 
-        if opt.load_backbone_only:
-            # Only load keys whose name exists in the model AND has matching shape.
-            # This works for: (a) Res2Net official weights, (b) previous CFANet ckpt
+        if looks_like_single_res2net_backbone(ckpt):
+            backbone_keys = map_single_backbone_to_dual_backbone(ckpt, model_dict)
+            model_dict.update(backbone_keys)
+            missing, unexpected = model.load_state_dict(model_dict, strict=False)
+            print('  detected official single-backbone Res2Net weights')
+            print('  copied {} tensors into backbone_t1/backbone_t2, missing={}, unexpected={}'.format(
+                len(backbone_keys), len(missing), len(unexpected)))
+        elif opt.load_backbone_only:
+            # Load only backbone tensors from a dual-backbone / full-model checkpoint.
             backbone_keys = {k: v for k, v in ckpt.items()
-                             if k in model_dict and v.shape == model_dict[k].shape
+                             if k in model_dict and hasattr(v, 'shape')
+                             and v.shape == model_dict[k].shape
                              and (k.startswith('backbone_t1.') or k.startswith('backbone_t2.'))}
             model_dict.update(backbone_keys)
             missing, unexpected = model.load_state_dict(model_dict, strict=False)
-            print('  loaded {} backbone tensors'.format(len(backbone_keys)))
+            print('  loaded {} backbone tensors from checkpoint, missing={}, unexpected={}'.format(
+                len(backbone_keys), len(missing), len(unexpected)))
         else:
             # tolerant load: fill matching keys, ignore the rest
             if opt.strict_load:
@@ -455,7 +594,7 @@ if __name__ == "__main__":
                 print('  strict load OK')
             else:
                 matched = {k: v for k, v in ckpt.items()
-                           if k in model_dict and v.shape == model_dict[k].shape}
+                           if k in model_dict and hasattr(v, 'shape') and v.shape == model_dict[k].shape}
                 model_dict.update(matched)
                 missing, unexpected = model.load_state_dict(model_dict, strict=False)
                 print('  loaded {}/{} tensors, missing={}, unexpected={}'.format(
@@ -478,46 +617,56 @@ if __name__ == "__main__":
         return small_target_loss(
             p, m,
             w_ft=opt.w_ft, w_bce=opt.w_bce, w_dice=opt.w_dice,
+            ft_alpha=opt.ft_alpha, ft_beta=opt.ft_beta,
             ft_gamma=opt.ft_gamma, boundary_k=opt.boundary_k,
         )
     loss_func = make_loss
     deep_sup_w = tuple(float(x) for x in opt.deep_sup_w.split(','))
     assert len(deep_sup_w) == 4, f'--deep_sup_w must have 4 values, got {opt.deep_sup_w}'
 
-    # ------------------ DataLoaders (NIfTI medical slices) ------------------ #
-    # num_workers=0 keeps the loader in the main process — simpler, and
-    # avoids the end-of-epoch worker-shutdown crashes we hit twice.
+    # ------------------ DataLoaders ------------------ #
+    # For preprocessed .npy slices we can safely use a few workers.
+    # For online NIfTI loading, 0 workers remains the safest default.
+    loader_workers = 2 if opt.data_format == 'npy' else 0
     train_loader = get_loader(opt.train_root, split='train',
                               batchsize=opt.batchsize, trainsize=opt.trainsize,
-                              num_workers=0, augment=True,
+                              num_workers=loader_workers, augment=True,
                               crop_size=opt.crop_size,
                               mask_combine=opt.mask_combine,
                               resplit=opt.resplit, seed=opt.resplit_seed,
                               train_ratio=opt.train_ratio,
                               val_ratio=opt.val_ratio,
-                              test_ratio=opt.test_ratio)
+                              test_ratio=opt.test_ratio,
+                              data_format=opt.data_format,
+                              pos_sample_weight=opt.pos_sample_weight)
     val_loader   = get_loader(opt.val_root, split='val',
                               batchsize=opt.batchsize, trainsize=opt.trainsize,
-                              num_workers=0, augment=False,
+                              num_workers=loader_workers, augment=False,
                               mask_combine=opt.mask_combine,
                               resplit=opt.resplit, seed=opt.resplit_seed,
                               train_ratio=opt.train_ratio,
                               val_ratio=opt.val_ratio,
-                              test_ratio=opt.test_ratio)
+                              test_ratio=opt.test_ratio,
+                              data_format=opt.data_format,
+                              pos_sample_weight=1.0)
     test_loader  = get_loader(opt.test_root, split='test',
                               batchsize=opt.batchsize, trainsize=opt.trainsize,
-                              num_workers=0, augment=False,
+                              num_workers=loader_workers, augment=False,
                               mask_combine=opt.mask_combine,
                               resplit=opt.resplit, seed=opt.resplit_seed,
                               train_ratio=opt.train_ratio,
                               val_ratio=opt.val_ratio,
-                              test_ratio=opt.test_ratio)
+                              test_ratio=opt.test_ratio,
+                              data_format=opt.data_format,
+                              pos_sample_weight=1.0)
 
     total_step = len(train_loader)
 
-    print('-' * 30, "\n[Training Dataset INFO]\nroot: {}\nLearning Rate: {}\nBatch Size: {}\n"
-                    "Training Save: {}\ntotal_num: {}\n".format(opt.train_root, opt.lr,
-                                                              opt.batchsize, opt.save_model, total_step), '-' * 30)
+    print('-' * 30, "\n[Training Dataset INFO]\nformat: {}\ntrain_root: {}\nval_root: {}\n"
+                    "test_root: {}\nLearning Rate: {}\nBatch Size: {}\nTraining Save: {}\n"
+                    "total_num: {}\n".format(opt.data_format, opt.train_root, opt.val_root,
+                                             opt.test_root, opt.lr, opt.batchsize,
+                                             opt.save_model, total_step), '-' * 30)
 
     for epoch_iter in range(1, opt.epoch + 1):
 
@@ -525,6 +674,23 @@ if __name__ == "__main__":
 
         train(train_loader, model, optimizer, epoch_iter, opt, loss_func, total_step,
               deep_sup_w=deep_sup_w, grad_clip=opt.grad_clip)
+        if opt.val_eval_interval and opt.val_eval_interval > 0:
+            if (epoch_iter % opt.val_eval_interval == 0) or (epoch_iter == opt.epoch):
+                fg_mean, all_mean, fg_n, all_n = eval_val_foreground_dice(
+                    val_loader, model, threshold=opt.val_threshold
+                )
+                print('Epoch: {} ValDice(fg): {:.4f} (n={}) ValDice(all): {:.4f} (n={})  bestValFgDice: {:.4f} bestEpoch: {}'.format(
+                    epoch_iter, fg_mean, fg_n, all_mean, all_n, best_val_fg_dice, best_val_fg_epoch
+                ))
+                logging.info('#VAL#:Epoch {:03d}/{:03d}, fg_dice: {:.4f} (n={}), all_dice: {:.4f} (n={}), best_fg_dice: {:.4f} best_epoch: {}'.format(
+                    epoch_iter, opt.epoch, fg_mean, fg_n, all_mean, all_n, best_val_fg_dice, best_val_fg_epoch
+                ))
+                if fg_n > 0 and fg_mean > best_val_fg_dice:
+                    best_val_fg_dice = fg_mean
+                    best_val_fg_epoch = epoch_iter
+                    torch.save(model.state_dict(), os.path.join(opt.save_model, 'Cod_best_fg.pth'))
+                    print('best val foreground dice epoch:{}'.format(epoch_iter))
+                    logging.info('#VAL#:best foreground dice epoch: {}'.format(epoch_iter))
         #test(test_loader,   model, epoch_iter, opt.save_model)
         
         

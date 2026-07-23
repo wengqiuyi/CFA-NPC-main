@@ -26,10 +26,16 @@ for _data_name in ['CVC-300', 'CVC-ClinicDB', 'Kvasir', 'CVC-ColonDB', 'ETIS-Lar
     
     
     opt   = parser.parse_args()
-    model = CFANet(channel=64).cuda()
+    model = CFANet(channel=64, dual_backbone=True).cuda()
     
     
-    model.load_state_dict(torch.load(opt.pth_path))
+    state = torch.load(opt.pth_path)
+    if isinstance(state, dict) and 'state_dict' in state:
+        state = state['state_dict']
+    elif isinstance(state, dict) and 'model' in state:
+        state = state['model']
+    msg = model.load_state_dict(state, strict=False)
+    print('loaded {}  missing={}  unexpected={}'.format(opt.pth_path, len(msg.missing_keys), len(msg.unexpected_keys)))
     model.cuda()
     model.eval()
 
@@ -54,8 +60,8 @@ for _data_name in ['CVC-300', 'CVC-ClinicDB', 'Kvasir', 'CVC-ColonDB', 'ETIS-Lar
 
         _,_,_,res = model(image)
 
-        res = F.upsample(res, size=gt.shape, mode='bilinear', align_corners=False)
+        res = F.interpolate(res, size=gt.shape, mode='bilinear', align_corners=False)
         res = res.sigmoid().data.cpu().numpy().squeeze()
         res = (res - res.min()) / (res.max() - res.min() + 1e-8)
 
-        cv2.imwrite(save_path+name, res*255)
+        cv2.imwrite(save_path+name, (res * 255).astype(np.uint8))

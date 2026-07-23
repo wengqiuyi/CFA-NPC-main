@@ -55,8 +55,8 @@ class FFTCMA(nn.Module):
         x2 = self.reduce2(x2)
 
         # Frequency domain decomposition
-        fft1 = torch.fft.rfft2(x1.float(), norm='ortho')
-        fft2 = torch.fft.rfft2(x2.float(), norm='ortho')
+        fft1 = torch.fft.rfft2(x1, norm='ortho')
+        fft2 = torch.fft.rfft2(x2, norm='ortho')
         amp1, pha1 = torch.abs(fft1), torch.angle(fft1)
         amp2, pha2 = torch.abs(fft2), torch.angle(fft2)
 
@@ -284,7 +284,7 @@ class CFANet(nn.Module):
     def _upsample_to(self, x, ref):
         """Bilinearly upsample ``x`` to the spatial size of ``ref``."""
         return F.interpolate(x, size=ref.shape[-2:],
-                             mode='bilinear', align_corners=True)
+                             mode='bilinear', align_corners=False)
 
     # ------------------------------------------------------------------ #
     def forward(self, x1, x2=None):
@@ -343,9 +343,9 @@ class CFANet(nn.Module):
         f25 = self.efc_bot4(f24, f15)
 
         # ---- Prediction heads (upsample to input size) ----
-        mask1 = F.interpolate(self.head1(f5),  size=(H, W), mode='bilinear', align_corners=True)
-        mask2 = F.interpolate(self.head2(f15), size=(H, W), mode='bilinear', align_corners=True)
-        mask3 = F.interpolate(self.head3(f25), size=(H, W), mode='bilinear', align_corners=True)
+        mask1 = F.interpolate(self.head1(f5),  size=(H, W), mode='bilinear', align_corners=False)
+        mask2 = F.interpolate(self.head2(f15), size=(H, W), mode='bilinear', align_corners=False)
+        mask3 = F.interpolate(self.head3(f25), size=(H, W), mode='bilinear', align_corners=False)
 
         # ---- Final fused mask ----
         mask = mask1 + mask2 + mask3

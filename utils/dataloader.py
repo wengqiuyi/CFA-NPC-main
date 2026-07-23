@@ -22,8 +22,8 @@ def randomCrop(image, label,edge):
     border = 30
     image_width    = image.size[0]
     image_height   = image.size[1]
-    crop_win_width = np.random.randint(image_width - border, image_width)
-    crop_win_height = np.random.randint(image_height - border, image_height)
+    crop_win_width = np.random.randint(max(1, image_width - border), image_width + 1)
+    crop_win_height = np.random.randint(max(1, image_height - border), image_height + 1)
     random_region = (
         (image_width - crop_win_width) >> 1, (image_height - crop_win_height) >> 1, (image_width + crop_win_width) >> 1,
         (image_height + crop_win_height) >> 1)
@@ -175,17 +175,21 @@ class PolypObjDataset(data.Dataset):
         return image, gt, eg
 
     def filter_files(self):
-        assert len(self.images) == len(self.gts) and len(self.gts) == len(self.images)
+        assert len(self.images) == len(self.gts) and len(self.images) == len(self.egs)
         images = []
         gts = []
-        for img_path, gt_path in zip(self.images, self.gts):
+        egs = []
+        for img_path, gt_path, eg_path in zip(self.images, self.gts, self.egs):
             img = Image.open(img_path)
             gt = Image.open(gt_path)
-            if img.size == gt.size:
+            eg = Image.open(eg_path)
+            if img.size == gt.size and img.size == eg.size:
                 images.append(img_path)
                 gts.append(gt_path)
+                egs.append(eg_path)
         self.images = images
         self.gts = gts
+        self.egs = egs
 
     def rgb_loader(self, path):
         with open(path, 'rb') as f:
