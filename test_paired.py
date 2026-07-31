@@ -26,13 +26,13 @@ Notes
 * The model is built with ``dual_backbone=True`` (the train-time
   configuration) so the two encoders are separate and the FFTCMA /
   GlobalFusion modules actually fuse real T1/T2 features.
-* The eval split is the deterministic 80/10/10 re-split used by
-  training — make sure you keep ``--seed`` and the ``--*_ratio``
-  flags identical to those used at training time, otherwise
-  you'll be evaluating on a different set of patients.
-* The model produces **four** outputs (mask1, mask2, mask3, mask).
-  We average the four sigmoid probabilities before thresholding —
-  this consistently improves over taking only ``mask``.
+  * The eval split is the deterministic 80/10/10 re-split used by
+    training — make sure you keep ``--seed`` and the ``--*_ratio``
+    flags identical to those used at training time, otherwise
+    you'll be evaluating on a different set of patients.
+  * The model produces **four** outputs (mask1, mask2, mask3, mask).
+    ``mask`` is the learnable final fusion head and is the only output
+    used for validation / testing so train and eval share the same target.
 * The eval ground truth is the **combined T1|T2 mask** (the same
   target the model was trained on).  If you change ``--mask_combine``
   here, you must use the same value at training time.
@@ -162,7 +162,7 @@ def parse_args():
 # Optional TTA
 # --------------------------------------------------------------------------- #
 def tta_forward(model, x1: torch.Tensor, x2: torch.Tensor) -> np.ndarray:
-    """Average 8 augmented forward passes.  Returns a (B, 1, H, W) prob array."""
+    """Average 8 augmented forward passes of the final fused mask."""
     B, _, H, W = x1.shape
     probs = torch.zeros(B, 1, H, W, device=x1.device, dtype=x1.dtype)
     n_views = 0
@@ -174,9 +174,8 @@ def tta_forward(model, x1: torch.Tensor, x2: torch.Tensor) -> np.ndarray:
                 x1a = torch.flip(x1a, dims=(-1,))
                 x2a = torch.flip(x2a, dims=(-1,))
             with torch.no_grad():
-                s1, s2, s3, sm = model(x1a, x2a)
-            p = (torch.sigmoid(s1) + torch.sigmoid(s2) +
-                 torch.sigmoid(s3) + torch.sigmoid(sm)) / 4.0
+                _, _, _, sm = model(x1a, x2a)
+            p = torch.sigmoid(sm)
             # invert the geometric transformation
             p = torch.rot90(p, k=-k, dims=(-2, -1))
             if flip:
@@ -245,9 +244,8 @@ def main():
             if opt.tta:
                 probs = tta_forward(model, x1, x2)
             else:
-                s1, s2, s3, sm = model(x1, x2)
-                probs = (torch.sigmoid(s1) + torch.sigmoid(s2) +
-                         torch.sigmoid(s3) + torch.sigmoid(sm)) / 4.0
+                _, _, _, sm = model(x1, x2)
+                probs = torch.sigmoid(sm)
 
             pred_bin = (probs >= opt.threshold).cpu().numpy()
             gt_bin   = (gt    >= 0.5).cpu().numpy()

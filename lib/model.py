@@ -25,7 +25,7 @@ class BasicConv2d(nn.Module):
 ###############################################################################
 ##  FFT-based Cross-Modal Attention (FFT-CMA / FSCM)  — Level-1 fusion X0
 ###############################################################################
-class FFTCMA(nn.Module):
+class FSCM(nn.Module):
     """
     Cross-modal attention in the frequency domain.
     The two streams (T1-Block1, T2-Block1) exchange amplitude information
@@ -82,7 +82,6 @@ class FFTCMA(nn.Module):
 
 
 # Alias — FFTCMA is identical to FSCM (Frequency-domain Spectral Cross-Modal).
-FSCM = FFTCMA
 
 
 ###############################################################################
@@ -112,20 +111,6 @@ class GlobalFusion(nn.Module):
 ###############################################################################
 ##  Edge Block (Edge 0/1/2/3) — Top-branch feature refinement
 ###############################################################################
-class EdgeBlock(nn.Module):
-    """Edge-aware residual refinement block used in the top branch."""
-    def __init__(self, channels):
-        super(EdgeBlock, self).__init__()
-        self.conv1 = BasicConv2d(channels, channels, 3, padding=1)
-        self.conv2 = BasicConv2d(channels, channels, 3, padding=1)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        residual = x
-        x = self.conv1(x)
-        x = self.conv2(x)
-        return residual + self.gamma * x
-
 
 ###############################################################################
 ##  Cross-level Fusion Skip (CF) — simple skip connection (fallback)
@@ -154,7 +139,7 @@ class EFC(nn.Module):
         1. pre(x)   ──► *   (element-wise multiply with edge(skip))
         2. cat(*output, skip)  ──► channel-attention (CA) ──► *
         3. *output  ──► spatial-attention (SA) ──► *
-        4. final   = skip ⊗ sa_mask
+        4. final   = skip ⊗ sa_mask + proj([pre(x), edge_feat])
 
     Args:
         channels (int):  channel number of both ``x`` and ``skip``.
@@ -191,6 +176,9 @@ class EFC(nn.Module):
             nn.Sigmoid()
         )
 
+        # 5) residual injection of the main branch x / edge_feat into the output
+        self.residual_proj = BasicConv2d(channels * 2, channels, 3, padding=1)
+
     def forward(self, x, skip):
         # step 1:  pre(x) ⊗ edge(skip)
         pre_x = self.pre(x)
@@ -206,11 +194,13 @@ class EFC(nn.Module):
 
         # step 4:  spatial attention, then apply to skip
         sa  = self.spatial_att(ca_feat)
-        out = skip * sa
+        gated_skip = skip * sa
+
+        # step 5:  直接将主分支特征作为残差注入
+        residual = self.residual_proj(torch.cat([pre_x, edge_feat], dim=1))
+        out = gated_skip + residual
 
         return out
-
-
 # Backward-compat alias (the module used to be named EFA in this file).
 EFA = EFC
 
@@ -245,10 +235,10 @@ class CFANet(nn.Module):
 
         # ---- Cross-modal fusion at the 4 encoder levels ----
         # Res2Net-50 channel widths: x1=256, x2=512, x3=1024, x4=2048
-        self.fft_cma = FFTCMA(256,  256,  channel)    # -> X0
-        self.gf_x1   = GlobalFusion(512,  512,  channel)  # -> X1
-        self.gf_x2   = GlobalFusion(1024, 1024, channel)  # -> X2
-        self.gf_x3   = GlobalFusion(2048, 2048, channel)  # -> X3
+        self.fft_cma_x0 = FFTCMA(256,  256,  channel)      # T1/T2 Block1 -> X0
+        self.fft_cma_x1 = FFTCMA(512,  512,  channel)      # T1/T2 Block2 -> X1
+        self.gf_x2      = GlobalFusion(1024, 1024, channel)  # T1/T2 Block3 -> X2
+        self.gf_x3      = GlobalFusion(2048, 2048, channel)  # T1/T2 Block4 -> X3
 
         # X0 -> F1 (initial fusion of the top branch)
         self.fusion_x0 = BasicConv2d(channel, channel, 3, padding=1)
@@ -280,6 +270,12 @@ class CFANet(nn.Module):
         self.efc_bot4    = EFC(channel)                 # EFC(F24, F15) -> F25
         self.head3       = nn.Conv2d(channel, 1, kernel_size=1)
 
+        # ---- Final fusion head ----
+        # Learn the final prediction from the three decoder branches in
+        # feature space so train / val / test can all use the same output.
+        self.final_fuse = BasicConv2d(channel * 3, channel, 3, padding=1)
+        self.head_final = nn.Conv2d(channel, 1, kernel_size=1)
+
     # ------------------------------------------------------------------ #
     def _upsample_to(self, x, ref):
         """Bilinearly upsample ``x`` to the spatial size of ``ref``."""
@@ -303,19 +299,12 @@ class CFANet(nn.Module):
         _, t1_1, t1_2, t1_3, t1_4 = self.backbone_t1(x1)
         _, t2_1, t2_2, t2_3, t2_4 = self.backbone_t2(x2)
 
-        # All branches share the spatial size of T1-Block1 / T2-Block1 (1/4 of input)
-        target = t1_1.shape[-2:]
-
         # ---- 4-level cross-modal fusion ----
         # X0 from FFT-CMA (shallowest, two streams at the highest resolution)
-        x0 = self.fft_cma(t1_1, t2_1)                                                # X0
-        # X1, X2, X3 from Global Fusion at deeper levels (upsampled to target)
-        x1_fused = self.gf_x1(self._upsample_to(t1_2, t1_1),
-                              self._upsample_to(t2_2, t2_1))                          # X1
-        x2_fused = self.gf_x2(self._upsample_to(t1_3, t1_1),
-                              self._upsample_to(t2_3, t2_1))                          # X2
-        x3_fused = self.gf_x3(self._upsample_to(t1_4, t1_1),
-                              self._upsample_to(t2_4, t2_1))                          # X3
+        x0 = self.fft_cma_x0(t1_1, t2_1)                                             # X0
+        x1_fused = self.fft_cma_x1(t1_2, t2_2)                                       # X1
+        x2_fused = self.gf_x2(t1_3, t2_3)                                            # X2
+        x3_fused = self.gf_x3(t1_4, t2_4)                                            # X3
 
         # =================== Top branch (X0 -> mask1) =================== #
         f1 = self.fusion_x0(x0)
@@ -327,20 +316,22 @@ class CFANet(nn.Module):
         # ================= Middle branch (X1 -> mask2) ================== #
         # F11 = X1 + CF(F1)                       (CF = simple skip)
         # F1i = EFC(F1(i-1), Fi)   for i=2..5    (EFC = BAM-replacement, 创新点 2)
-        f11 = x1_fused + self.cf_mid1(f1)
-        f12 = self.efc_mid1(f11, f2)
-        f13 = self.efc_mid2(f12, f3)
-        f14 = self.efc_mid3(f13, f4)
-        f15 = self.efc_mid4(f14, f5)
+        f1_d1 = self._upsample_to(self.cf_mid1(f1), x1_fused)
+        f11 = x1_fused + f1_d1
+        f12 = self.efc_mid1(f11, self._upsample_to(f2, x1_fused))
+        f13 = self.efc_mid2(f12, self._upsample_to(f3, x1_fused))
+        f14 = self.efc_mid3(f13, self._upsample_to(f4, x1_fused))
+        f15 = self.efc_mid4(f14, self._upsample_to(f5, x1_fused))
 
         # ================= Bottom branch (X2/X3 -> mask3) =============== #
         # F21 = X2 + CF(X3)                                  (CF = simple skip)
         # F2i = EFC(F2(i-1), F1(i-1))   for i=2..5          (EFC = BAM-replacement)
-        f21 = x2_fused + self.cf_bot1(x3_fused)
-        f22 = self.efc_bot1(f21, f12)
-        f23 = self.efc_bot2(f22, f13)
-        f24 = self.efc_bot3(f23, f14)
-        f25 = self.efc_bot4(f24, f15)
+        x3_u2 = self._upsample_to(x3_fused, x2_fused)
+        f21 = x2_fused + self.cf_bot1(x3_u2)
+        f22 = self.efc_bot1(f21, self._upsample_to(f12, x2_fused))
+        f23 = self.efc_bot2(f22, self._upsample_to(f13, x2_fused))
+        f24 = self.efc_bot3(f23, self._upsample_to(f14, x2_fused))
+        f25 = self.efc_bot4(f24, self._upsample_to(f15, x2_fused))
 
         # ---- Prediction heads (upsample to input size) ----
         mask1 = F.interpolate(self.head1(f5),  size=(H, W), mode='bilinear', align_corners=False)
@@ -348,6 +339,10 @@ class CFANet(nn.Module):
         mask3 = F.interpolate(self.head3(f25), size=(H, W), mode='bilinear', align_corners=False)
 
         # ---- Final fused mask ----
-        mask = mask1 + mask2 + mask3
+        f15_u = self._upsample_to(f15, f5)
+        f25_u = self._upsample_to(f25, f5)
+        final_feat = self.final_fuse(torch.cat([f5, f15_u, f25_u], dim=1))
+        mask = F.interpolate(self.head_final(final_feat), size=(H, W),
+                             mode='bilinear', align_corners=False)
 
         return mask1, mask2, mask3, mask

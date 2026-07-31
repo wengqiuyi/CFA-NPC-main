@@ -5,19 +5,16 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 import argparse
 
 from lib.model import CFANet
-from utils.trainer import adjust_lr, clip_gradient, eval_mae
+from utils.trainer import adjust_lr, clip_gradient
 # from utils.dataloader import get_loader,test_dataset   # deprecated: now use data.dataset
 from datetime import datetime
 
-import numpy as np
 import logging
-
-best_mae   = 1
-best_epoch = 0
 best_val_fg_dice = -1.0
 best_val_fg_epoch = 0
 
 
+#经典的医学图像分割损失函数，让模型更关注边界区域和小目标，而不是被大面积背景主导。
 def structure_loss(pred, mask):
     """
     Original structure loss (BCE + weighted IoU).
@@ -42,18 +39,18 @@ def structure_loss(pred, mask):
 #       + beta  * BoundaryAwareBCE (focuses on hard, blurred edges)
 #       + gamma * Dice             (smooth region overlap)
 # ===================================================================== #
-
+#标准的软 Dice 损失，与前面那段 structure_loss是互补关系
 def dice_loss(pred, mask, eps=1e-6):
     """
     Soft Dice loss — robust to class imbalance, ideal for small targets.
     """
-    p = torch.sigmoid(pred)
+    p = torch.sigmoid(pred)#激活函数
     inter = (p * mask).sum(dim=(2, 3))
     union = (p + mask).sum(dim=(2, 3))
     dice  = (2 * inter + eps) / (union + eps)
     return 1 - dice.mean()
 
-
+# Focal Tversky Loss（焦点 Tversky 损失）​ ，门针对极度类别不平衡 + 小目标难分割的任务设计。
 def focal_tversky_loss(pred, mask, alpha=0.7, beta=0.3, gamma=0.75, eps=1e-6):
     """
     Focal Tversky loss — adds an emphasis factor to Tversky index so
@@ -73,8 +70,7 @@ def focal_tversky_loss(pred, mask, alpha=0.7, beta=0.3, gamma=0.75, eps=1e-6):
     fn = ((1 - p) * mask).sum(dim=(2, 3))
     ti = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
     return ((1 - ti) ** gamma).mean()
-
-
+#边界感知 BCE（Boundary-Aware Binary Cross Entropy），用形态学操作圈出 GT mask 的边界带，然后给边界像素更高的 BCE 权重，迫使模型把边缘学得更锐利。
 def boundary_aware_bce(pred, mask, k=15):
     """
     BCE re-weighted by the boundary-band of the GT mask.
@@ -94,7 +90,7 @@ def boundary_aware_bce(pred, mask, k=15):
     bce       = F.binary_cross_entropy_with_logits(pred, mask, reduction='none')
     return (weight * bce).mean()
 
-
+#复合损失函数设计，把上面三个损失函数揉在了一起
 def small_target_loss(pred, mask,
                       w_ft=2.0, w_bce=0.15, w_dice=0.5,
                       ft_alpha=0.3, ft_beta=0.7, ft_gamma=1.0,
@@ -120,7 +116,7 @@ def small_target_loss(pred, mask,
           + w_bce  * boundary_aware_bce (pred, mask, boundary_k)
           + w_dice * dice_loss           (pred, mask))
 
-
+#非常实用的 checkpoint 解包工具函数，用于解决不同框架/不同训练脚本保存 checkpoint 的格式不统一
 def unwrap_state_dict(ckpt):
     """Unwrap common checkpoint wrappers and return a plain state_dict."""
     if isinstance(ckpt, dict) and 'state_dict' in ckpt:
@@ -144,7 +140,7 @@ def looks_like_single_res2net_backbone(state_dict):
             and any(k.startswith('conv1.') or k.startswith('bn1.') or k.startswith('layer1.')
                     for k in sample_keys))
 
-
+#判断一个state_dict是不是官方 Res2Net 单骨干权重
 def map_single_backbone_to_dual_backbone(state_dict, model_dict):
     """
     Copy one official Res2Net backbone state_dict into both encoder branches:
@@ -208,6 +204,7 @@ def get_loader(root, split, batchsize, trainsize, num_workers=4,
                              val_ratio=val_ratio,
                              test_ratio=test_ratio)
     sampler = None
+    #正样本过采样，解决类别不平衡问题
     if split == 'train' and pos_sample_weight > 1.0 and hasattr(ds, 'samples'):
         weights = [float(pos_sample_weight) if bool(s[5]) else 1.0 for s in ds.samples]
         sampler = WeightedRandomSampler(torch.tensor(weights, dtype=torch.double),
@@ -235,7 +232,7 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
     """
     model.train()
 
-    # multi-scale controlled by CLI; default is single-scale for stability
+    # 多尺度控制，小目标（0.4% 正像素）在 scale=1.25时会被缩到只剩几个像素，直接消失。多尺度对大目标有用，对小目标反而有害
     size_rates = [float(r) for r in opt.size_rates.split(',')] if opt.size_rates else [1.0]
     epoch_lrs = [pg['lr'] for pg in optimizer.param_groups]
     device = next(model.parameters()).device
@@ -255,7 +252,7 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
 
             optimizer.zero_grad()
 
-            # ---- rescale ----
+            #  尺寸对齐（32 的倍数）
             trainsize = int(round(opt.trainsize*rate/32)*32)
             if rate != 1:
                 images_t1 = F.interpolate(images_t1_0, size=(trainsize, trainsize),
@@ -269,10 +266,10 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
                 images_t2 = images_t2_0
                 gts = gts_0
 
-            # ---- forward ----
+            # 前向传播
             sal_out1, sal_out2, sal_out3, mask = model(images_t1, images_t2)
 
-            # small_target_loss is parameterised via CLI; pass through
+            #  深监督损失， 四个输出共用同一个 GT
             loss_sal1  = loss_func(sal_out1, gts)
             loss_sal2  = loss_func(sal_out2, gts)
             loss_sal3  = loss_func(sal_out3, gts)
@@ -281,7 +278,7 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
             w1, w2, w3, wm = deep_sup_w
             loss_total = w1*loss_sal1 + w2*loss_sal2 + w3*loss_sal3 + wm*loss_mask
 
-            # ---- NaN / inf guard: skip the optimizer step if loss blew up ----
+            # NaN/Inf 守卫。这是防止训练崩溃的最后一道防线。没有它，一个 NaN batch 就能毁掉整个 epoch。
             if not torch.isfinite(loss_total):
                 print('[{}] => [WARN] non-finite loss at step {}, skipping update '
                       '(sal1={:.3f} sal2={:.3f} sal3={:.3f} mask={:.3f})'.format(
@@ -300,16 +297,9 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
 
             # ---- gradient clipping (stability) ----
             if grad_clip and grad_clip > 0:
+                #梯度裁剪
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-            # ---- warmup (linear over the first N global steps) ----
-            # IMPORTANT: multiply the *original* learning rate by warm
-            # each step.  Do NOT compound a `base_lr` across steps —
-            # the previous version used `base_lr = pg['lr'] / warm`
-            # and then `pg['lr'] = base_lr * warm`, which made the LR
-            # *quadratically* ramp up to 200x the configured value
-            # over 200 warmup steps.  That blew up to 1e-2 and
-            # produced the NaN that ended epoch 6.
             if opt.warmup_steps > 0:
                 warm = min(1.0, (step + 1) / max(1, opt.warmup_steps))
                 for i, pg in enumerate(optimizer.param_groups):
@@ -324,11 +314,11 @@ def train(train_loader, model, optimizer, epoch, opt, loss_func, total_step,
             logging.info('#TRAIN#:Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], Loss_sal1: {:.4f} Loss_sal2: {:.4f} Loss_sal3: {:.4f} Loss_mask: {:.4f} Loss_total: {:.4f}'.
                     format( epoch, opt.epoch, step, total_step, loss_sal1.data, loss_sal2.data, loss_sal3.data, loss_mask.data, loss_total.data))
 
-
+    #模型保存逻辑
     if (epoch) % opt.save_epoch == 0:
         torch.save(model.state_dict(), os.path.join(opt.save_model, 'CODNet_%d.pth' % (epoch)))
         
-        
+#针对小目标设计的Dice 评估函数，把"有病灶的切片"和"全部切片"分开统计
 def eval_val_foreground_dice(val_loader, model, threshold=0.5, eps=1e-7):
     model.eval()
     device = next(model.parameters()).device
@@ -340,9 +330,8 @@ def eval_val_foreground_dice(val_loader, model, threshold=0.5, eps=1e-7):
             x2 = batch['image_t2'].to(device, non_blocking=True)
             gt = batch['mask'].to(device, non_blocking=True)
 
-            s1, s2, s3, sm = model(x1, x2)
-            probs = (torch.sigmoid(s1) + torch.sigmoid(s2) +
-                     torch.sigmoid(s3) + torch.sigmoid(sm)) / 4.0
+            _, _, _, sm = model(x1, x2)
+            probs = torch.sigmoid(sm)
             pred = (probs >= threshold).to(gt.dtype)
             gt_b = (gt >= 0.5).to(gt.dtype)
 
@@ -359,60 +348,9 @@ def eval_val_foreground_dice(val_loader, model, threshold=0.5, eps=1e-7):
                 fg.extend(dice[has_fg].detach().cpu().tolist())
 
     model.train()
-    fg_mean = float(sum(fg) / max(1, len(fg)))
+    fg_mean = float(sum(fg) / max(1, len(fg)))#	只含淋巴结的切片的平均 Dice
     all_mean = float(sum(all_d) / max(1, len(all_d)))
     return fg_mean, all_mean, int(len(fg)), int(len(all_d))
-
-
-def test(test_loader, model, epoch, save_path):
-    global best_mae, best_epoch
-    model.eval()
-
-    with torch.no_grad():
-        mae_sum = 0.0
-        n = 0
-
-        if hasattr(test_loader, 'size') and hasattr(test_loader, 'load_data'):
-            for _ in range(test_loader.size):
-                image, gt, _name = test_loader.load_data()
-                gt = np.asarray(gt, np.float32)
-                gt /= (gt.max() + 1e-8)
-
-                image = image.cuda()
-                _, _, _, res = model(image)
-                res = F.interpolate(res, size=gt.shape, mode='bilinear', align_corners=False)
-                res = res.sigmoid().data.cpu().numpy().squeeze()
-                res = (res - res.min()) / (res.max() - res.min() + 1e-8)
-                mae_sum += float(np.mean(np.abs(res - gt)))
-                n += 1
-        else:
-            device = next(model.parameters()).device
-            for batch in test_loader:
-                x1 = batch['image_t1'].to(device, non_blocking=True)
-                x2 = batch['image_t2'].to(device, non_blocking=True)
-                gt = batch['mask'].to(device, non_blocking=True)
-
-                s1, s2, s3, sm = model(x1, x2)
-                probs = (torch.sigmoid(s1) + torch.sigmoid(s2) +
-                         torch.sigmoid(s3) + torch.sigmoid(sm)) / 4.0
-
-                if probs.shape[-2:] != gt.shape[-2:]:
-                    probs = F.interpolate(probs, size=gt.shape[-2:], mode='bilinear', align_corners=False)
-
-                mae_sum += float(torch.abs(probs - gt).mean().item()) * probs.shape[0]
-                n += int(probs.shape[0])
-
-        mae = mae_sum / max(1, n)
-
-        print('Epoch: {} MAE: {} ####  bestMAE: {} bestEpoch: {}'.format(epoch, mae, best_mae, best_epoch))
-        if epoch == 1:
-            best_mae = mae
-        else:
-            if mae < best_mae:
-                best_mae = mae
-                best_epoch = epoch
-                torch.save(model.state_dict(), os.path.join(save_path, 'Cod_best.pth'))
-                print('best epoch:{}'.format(epoch))
                 
        
         
@@ -612,7 +550,7 @@ if __name__ == "__main__":
 
     optimizer = torch.optim.Adam(model.parameters(), opt.lr)
 
-    # ------------------ Configurable loss (CLI-controlled weights) ---------- #
+    # "训练前准备区"代码，负责把损失函数、深监督权重、三个数据加载器全部装配好
     def make_loss(p, m):
         return small_target_loss(
             p, m,
