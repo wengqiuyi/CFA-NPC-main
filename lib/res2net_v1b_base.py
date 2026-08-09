@@ -95,13 +95,13 @@ class Bottle2neck(nn.Module):
 
 class Res2Net(nn.Module):
 
-    def __init__(self, block, layers, baseWidth = 26, scale = 4, num_classes=1000):
+    def __init__(self, block, layers, baseWidth = 26, scale = 4, num_classes=1000, in_channels=3):
         self.inplanes = 64
         super(Res2Net, self).__init__()
         self.baseWidth = baseWidth
         self.scale = scale
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, 2, 1, bias=False),
+            nn.Conv2d(in_channels, 32, 3, 2, 1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 32, 3, 1, 1, bias=False),
@@ -169,14 +169,14 @@ class Res2Net(nn.Module):
 
 class Res2Net_Ours(nn.Module):
 
-    def __init__(self, block, layers, baseWidth = 26, scale = 4, num_classes=1000):
+    def __init__(self, block, layers, baseWidth = 26, scale = 4, num_classes=1000, in_channels=3):
         self.inplanes = 64
         super(Res2Net_Ours, self).__init__()
         
         self.baseWidth = baseWidth
         self.scale = scale
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, 2, 1, bias=False),
+            nn.Conv2d(in_channels, 32, 3, 2, 1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 32, 3, 1, 1, bias=False),
@@ -246,10 +246,11 @@ def res2net50_v1b(pretrained=False, **kwargs):
     """
     model = Res2Net(Bottle2neck, [3, 4, 6, 3], baseWidth = 26, scale = 4, **kwargs)
     if pretrained:
-        #model.load_state_dict(model_zoo.load_url(model_urls['res2net50_v1b_26w_4s'],map_location='cpu'))
-
-        ckpt = torch.load('./lib/res2net50_v1b_26w_4s-3cf99910.pth',
-                          map_location='cpu')
+        local_ckpt = './lib/res2net50_v1b_26w_4s-3cf99910.pth'
+        if os.path.isfile(local_ckpt):
+            ckpt = torch.load(local_ckpt, map_location='cpu')
+        else:
+            ckpt = model_zoo.load_url(model_urls['res2net50_v1b_26w_4s'], map_location='cpu')
         if isinstance(ckpt, dict) and 'state_dict' in ckpt:
             ckpt = ckpt['state_dict']
         model.load_state_dict(ckpt)
@@ -268,12 +269,47 @@ def res2net101_v1b(pretrained=False, **kwargs):
 
 
 
+def _res2net_ours_load_pretrained(model, ckpt, in_channels):
+    """Apply ImageNet weights to Res2Net_Ours, handling arbitrary in_channels.
+
+    All layers except conv1.0.weight match 1:1 between the 3-ch ImageNet
+    checkpoint and the k_slice-channel model.  For conv1.0 we linearly
+    interpolate the 3 RGB filters onto in_channels along the channel axis,
+    which preserves edge/blob/texture priors while accepting z-stack input.
+    """
+    if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+        ckpt = ckpt['state_dict']
+    ckpt = {k: v for k, v in ckpt.items() if not k.startswith('fc.')}
+    FIRST = 'conv1.0.weight'
+    if FIRST in ckpt and in_channels != 3:
+        w3 = ckpt[FIRST]
+        Cout, Cin_old, kh, kw = w3.shape
+        flat = w3.reshape(Cout, Cin_old, kh * kw).permute(0, 2, 1).contiguous()
+        scaled = torch.nn.functional.interpolate(
+            flat.float(), size=in_channels, mode='linear', align_corners=False
+        )
+        w_new = scaled.permute(0, 2, 1).reshape(Cout, in_channels, kh, kw).contiguous()
+        # Magnitude-normalise so total energy per output channel matches 3-ch.
+        w_new = w_new * (float(Cin_old) / float(in_channels))
+        ckpt[FIRST] = w_new.to(dtype=w3.dtype)
+    model_dict = model.state_dict()
+    # Only load keys that match *both* name and shape (catches any other
+    # differences like mismatched stem width for non-3 inputs).
+    matched = {k: v for k, v in ckpt.items()
+               if k in model_dict
+               and hasattr(v, 'shape') and tuple(v.shape) == tuple(model_dict[k].shape)}
+    model_dict.update(matched)
+    model.load_state_dict(model_dict, strict=False)
+    return matched
+
+
 def res2net50_v1b_Ours(pretrained=False, **kwargs):
     """Constructs a Res2Net-50_v1b model.
     Res2Net-50 refers to the Res2Net-50_v1b_26w_4s.
     Args:
         pretrained (bool): If True, returns a model pre-trained on ImageNet
     """
+    in_channels = int(kwargs.get('in_channels', 3))
     model = Res2Net_Ours(Bottle2neck, [3, 4, 6, 3], baseWidth = 26, scale = 4, **kwargs)
     if pretrained:
         local_ckpt = './lib/res2net50_v1b_26w_4s-3cf99910.pth'
@@ -282,26 +318,21 @@ def res2net50_v1b_Ours(pretrained=False, **kwargs):
         else:
             ckpt = model_zoo.load_url(model_urls['res2net50_v1b_26w_4s'],
                                       map_location='cpu')
-        if isinstance(ckpt, dict) and 'state_dict' in ckpt:
-            ckpt = ckpt['state_dict']
-        # strip the FC classifier head (not present in Res2Net_Ours)
-        ckpt = {k: v for k, v in ckpt.items() if not k.startswith('fc.')}
-        model.load_state_dict(ckpt)
+        _res2net_ours_load_pretrained(model, ckpt, in_channels)
     return model
+
 
 def res2net101_v1b_Ours(pretrained=False, **kwargs):
     """Constructs a Res2Net-50_v1b_26w_4s model.
     Args:
         pretrained (bool): If True, returns a model pre-trained on ImageNet
     """
+    in_channels = int(kwargs.get('in_channels', 3))
     model = Res2Net_Ours(Bottle2neck, [3, 4, 23, 3], baseWidth = 26, scale = 4, **kwargs)
     if pretrained:
         ckpt = model_zoo.load_url(model_urls['res2net101_v1b_26w_4s'],
                                   map_location='cpu')
-        if isinstance(ckpt, dict) and 'state_dict' in ckpt:
-            ckpt = ckpt['state_dict']
-        ckpt = {k: v for k, v in ckpt.items() if not k.startswith('fc.')}
-        model.load_state_dict(ckpt)
+        _res2net_ours_load_pretrained(model, ckpt, in_channels)
     return model
 
 
@@ -339,24 +370,43 @@ def res2net152_v1b_26w_4s(pretrained=False, **kwargs):
 
 
    
-def Res2Net_model(ind=50):
+def Res2Net_model(ind=50, in_channels=3):
+    """Instantiate our custom Res2Net encoder used by CFANet.
+
+    Parameters
+    ----------
+    ind : {50, 101}
+        Res2Net depth (50 is the default used throughout this project).
+    in_channels : int
+        Number of input channels.  The original ImageNet checkpoint has
+        ``in_channels == 3`` (RGB / 2.5D stack).  For pseudo-3D input with
+        ``k_slice > 3`` the caller should pass ``in_channels = k_slice``.
+        The first conv weights will be *linearly interpolated* from the 3ch
+        ImageNet pre-trained weights so k_slice=3 is numerically identical
+        to the legacy behaviour, but k=9/15/... still start from a
+        meaningful visual filter (as opposed to random init).
+    """
+    in_channels = int(in_channels)
+    if in_channels <= 0:
+        raise ValueError(f"in_channels must be > 0, got {in_channels}")
 
     if ind == 50:
         model_base = res2net50_v1b(pretrained=True)
-        model      = res2net50_v1b_Ours(pretrained=True)
+        model      = res2net50_v1b_Ours(pretrained=True, in_channels=in_channels)
 
     if ind == 101:
         model_base = res2net101_v1b(pretrained=True)
-        model      = res2net101_v1b_Ours(pretrained=True)
-
+        model      = res2net101_v1b_Ours(pretrained=True, in_channels=in_channels)
 
     pretrained_dict = model_base.state_dict()
     model_dict      = model.state_dict()
 
-    pretrained_dict =  {k: v for k, v in pretrained_dict.items() if k in model_dict}
+    pretrained_dict = {k: v for k, v in pretrained_dict.items()
+                       if k in model_dict
+                       and hasattr(v, 'shape') and tuple(v.shape) == tuple(model_dict[k].shape)}
 
     model_dict.update(pretrained_dict)
-    model.load_state_dict(model_dict)
+    model.load_state_dict(model_dict, strict=False)
 
     return model
 

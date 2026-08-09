@@ -96,7 +96,7 @@ def small_target_loss(pred, mask,
                       ft_alpha=0.3, ft_beta=0.7, ft_gamma=1.0,
                       boundary_k=5):
     """
-    Combined loss for small-object binary segmentation.
+    Combined loss for small-object binary segmentation (legacy).
 
         L = w_ft   * FocalTversky
           + w_bce  * BoundaryAwareBCE
@@ -115,6 +115,100 @@ def small_target_loss(pred, mask,
     return (w_ft   * focal_tversky_loss(pred, mask, ft_alpha, ft_beta, ft_gamma)
           + w_bce  * boundary_aware_bce (pred, mask, boundary_k)
           + w_dice * dice_loss           (pred, mask))
+
+
+# ===================================================================== #
+#   用户显式推荐的组合损失：Dice (0.5) + Focal (0.3) + Boundary (0.2)       #
+# ===================================================================== #
+#   用户原话："小目标在交叉熵损失中贡献极小，必须使用组合损失。                #
+#   ——  Dice 处理类别不平衡 /  Focal 压制易分背景 /  Boundary 抓边缘      #
+# ===================================================================== #
+def binary_focal_loss(pred, mask, alpha=0.25, gamma=2.0, eps=1e-6):
+    """
+    Binary Focal Loss (BCE-based, logits input).
+
+        pt = p        when y==1
+           = 1 - p    when y==0
+        FL = - w_alpha * (1 - pt)^gamma * log(pt)
+
+    - alpha=0.25: 给正像素更高基础权重（头颈部淋巴结正像素仅占 <0.1%）。
+    - gamma=2.0 : 易分样本 pt≈1 时 (1-pt)^gamma ≈ 0，大面积背景像素的损失被压掉，
+                  只剩下困难像素（靠近病灶边缘）驱动梯度。
+    - 为什么小目标友好：
+        普通 BCE 里 99.9% 的梯度来自背景，小目标的梯度完全被淹没；
+        Focal 把背景损失压到可忽略的量级，小目标像素的梯度占据主导。
+    """
+    p = torch.sigmoid(pred).clamp(eps, 1 - eps)
+    bce = -(mask * torch.log(p) + (1 - mask) * torch.log(1 - p))
+    pt = p * mask + (1 - p) * (1 - mask)                 # 预测对的置信度 ∈[eps,1-eps]
+    alpha_weight = alpha * mask + (1 - alpha) * (1 - mask)
+    focal = alpha_weight * ((1 - pt) ** gamma) * bce
+    return focal.mean()
+
+
+def boundary_loss(pred, mask, k=5, eps=1e-6):
+    """
+    Boundary Loss —— boundary-band overlap (pred soft boundary ↔ GT hard boundary).
+
+    流程（全部可微分，纯 torch）:
+        (1) GT 的 k 像素边界带：hard dilate(>0.5) − hard erode(≥1.0)
+        (2) Prediction 的 soft 边界带：对 sigmoid(p) 直接做 avg_pool soft-dilate / soft-erode
+            → b_pred = soft_dil(p) − soft_ero(p)   （连续可微，梯度能完整回传到 logits）
+        (3) 对每个样本算 b_pred / b_gt 的 Dice，只有存在 GT 边界带的样本才计入。
+
+    为什么小目标必须有这一项：
+        15×15 淋巴结 1 像素轮廓偏差 → 全局 Dice 只掉 ~3%，但边界带 Dice 掉 >20%；
+        独立监督边界带才能把小目标的边缘压锐利。
+    为什么对 pred 用 soft 版本:
+        hard > 0.5 threshold 不可微分，pred 边界带用 soft-dilate/soft-erode 的差，
+        保证 loss → logits 梯度链完整（如果用 hard，boundary 项几乎没有梯度，学不动）。
+    """
+    kernel = 2 * k + 1
+    pad = k
+
+    def _hard_band(x_hard):
+        dil = (F.avg_pool2d(x_hard, kernel_size=kernel, stride=1, padding=pad) > 0.5).float()
+        ero = (F.avg_pool2d(x_hard, kernel_size=kernel, stride=1, padding=pad) >= 1.0).float()
+        return (dil - ero).clamp(min=0)
+
+    def _soft_band(p_soft):
+        # soft dilate: avg_pool + 只要邻域内存在高 p 就升高
+        dil = F.avg_pool2d(p_soft, kernel_size=kernel, stride=1, padding=pad)
+        # soft erode: 把 p 反过来（1-p）做 dilate，再反回来
+        ero = 1.0 - F.avg_pool2d(1.0 - p_soft, kernel_size=kernel, stride=1, padding=pad)
+        return (dil - ero).clamp(min=0, max=1)
+
+    b_gt = _hard_band(mask)
+    p_soft = torch.sigmoid(pred).clamp(eps, 1 - eps)
+    b_pred = _soft_band(p_soft)
+
+    has_gt = b_gt.sum(dim=(2, 3)) > 0                        # (B,1) bool
+    safe = has_gt.float()
+    inter = (b_pred * b_gt).sum(dim=(2, 3))
+    union = (b_pred + b_gt).sum(dim=(2, 3))
+    bdice_per = (2.0 * inter + eps) / (union + eps)
+    if safe.sum() == 0:
+        return (bdice_per * 0.0).mean()                      # 可微分 0
+    return 1.0 - (bdice_per * safe).sum() / safe.sum()
+
+
+def combined_loss(pred, target):
+    """
+    用户指定的小目标专用组合损失：Dice (0.5) + Focal (0.3) + Boundary (0.2)。
+
+        L = 0.5 * Dice
+          + 0.3 * Focal
+          + 0.2 * Boundary
+
+    - Dice    ：全局区域优化 + 天然抗类别不平衡。
+    - Focal   ：99% 背景像素的 BCE 损失被 (1-pt)^gamma 压到接近 0，
+                只剩下小目标 / 困难边缘像素主导梯度。
+    - Boundary：独立监督 k=5 的边界带 Dice，逼 15×15 小目标边缘锐利。
+    """
+    dice  = dice_loss(pred, target)
+    focal = binary_focal_loss(pred, target)
+    bound = boundary_loss(pred, target)
+    return 0.5 * dice + 0.3 * focal + 0.2 * bound
 
 #非常实用的 checkpoint 解包工具函数，用于解决不同框架/不同训练脚本保存 checkpoint 的格式不统一
 def unwrap_state_dict(ckpt):
@@ -164,7 +258,9 @@ def get_loader(root, split, batchsize, trainsize, num_workers=4,
                resplit=True, seed=42,
                train_ratio=0.8, val_ratio=0.2, test_ratio=0.0,
                data_format='npy',
-               pos_sample_weight=1.0):
+               pos_sample_weight=1.0,
+               k_slice=3,
+               use_roi_crop=False):
     """
     Build a torch.utils.data.DataLoader.
 
@@ -178,10 +274,22 @@ def get_loader(root, split, batchsize, trainsize, num_workers=4,
 
     if data_format == 'npy':
         from preprocessed_dataset import PreprocessedDataset
-        ds = PreprocessedDataset(root, split=split)
+        ds = PreprocessedDataset(root, split=split, augment=augment, seed=seed,
+                                 crop_size=crop_size, k_slice=k_slice,
+                                 use_roi_crop=use_roi_crop)
         sampler = None
         if split == 'train' and pos_sample_weight > 1.0:
-            weights = ds.build_sample_weights(pos_sample_weight)
+            # 策略 B (Oversampling tiny targets):
+            # build_sample_weights 默认 mode='area_inverse'，
+            # 给 <400px（~20x20）的极小淋巴结额外 ×3 权重 + 面积反平
+            # 方根加权，避免大病灶垄断梯度、小病灶永远学不到。
+            # 如果想退回到旧的二元加权，请把 mode 改成 'binary'。
+            weights = ds.build_sample_weights(
+                pos_sample_weight,
+                mode='area_inverse',
+                tiny_threshold=400,
+                tiny_weight_boost=3.0,
+            )
             sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
             shuffle = False
         return DataLoader(ds, batch_size=batchsize, shuffle=shuffle,
@@ -414,21 +522,40 @@ if __name__ == "__main__":
                              'The held-out test set comes from --test_root.')
 
     # ---- Loss / stability knobs (used to fix per-batch loss variance) ----
+    parser.add_argument('--k_slice',       type=int,   default=3,
+                        help='Number of adjacent 2-D slices stacked together '
+                             'as pseudo-3D input.  MUST be an odd positive '
+                             'integer:  3 = original 2.5D (centre ± 1 slice); '
+                             '9 / 15 = wider z-window to model inter-slice '
+                             'continuity.  The first Res2Net convolution is '
+                             'linearly interpolated from the 3-channel ImageNet '
+                             'checkpoint so k_slice > 3 still starts from a '
+                             'meaningful visual prior.  '
+                             'Input tensors shape per modality: (N, k_slice, H, W).')
+    parser.add_argument('--loss_fn',       type=str,   default='combined',
+                        choices=['combined', 'small_target_legacy'],
+                        help='损失函数选择：\n'
+                             '  - combined (默认，用户指定) : 0.5*Dice + 0.3*Focal + 0.2*Boundary\n'
+                             '  - small_target_legacy       : 2.0*FocalTversky + 0.15*BoundaryBCE + 0.5*Dice')
+    parser.add_argument('--fl_alpha',      type=float, default=0.25,
+                        help='Focal Loss alpha 正/负像素基础权重。淋巴结 <0.1% 像素时 0.25 是合理起点。')
+    parser.add_argument('--fl_gamma',      type=float, default=2.0,
+                        help='Focal Loss focusing exponent. 越大越只关注困难像素。')
+    parser.add_argument('--boundary_k',    type=int,   default=5,
+                        help='Boundary Loss (combined) 的边界带宽 half-width。'
+                             'k=5 → band width=11 px。越大越宽的边缘监督。')
     parser.add_argument('--w_ft',        type=float, default=2.0,
-                        help='Weight of Focal-Tversky (small-target friendly).')
+                        help='[legacy only] Weight of Focal-Tversky (small-target friendly).')
     parser.add_argument('--w_bce',       type=float, default=0.15,
-                        help='Weight of boundary-aware BCE. Use smaller values when empty slices dominate.')
+                        help='[legacy only] Weight of boundary-aware BCE. Use smaller values when empty slices dominate.')
     parser.add_argument('--w_dice',      type=float, default=0.5,
-                        help='Weight of Dice.')
+                        help='[legacy only] Weight of Dice.')
     parser.add_argument('--ft_alpha',    type=float, default=0.3,
-                        help='Focal-Tversky FP weight. Smaller values are more tolerant to false positives.')
+                        help='[legacy only] Focal-Tversky FP weight. Smaller values are more tolerant to false positives.')
     parser.add_argument('--ft_beta',     type=float, default=0.7,
-                        help='Focal-Tversky FN weight. Larger values reduce missed tiny lesions.')
+                        help='[legacy only] Focal-Tversky FN weight. Larger values reduce missed tiny lesions.')
     parser.add_argument('--ft_gamma',    type=float, default=1.0,
-                        help='Focusing exponent for Focal-Tversky. 1.0 is a good starting point for tiny targets.')
-    parser.add_argument('--boundary_k',  type=int,   default=5,
-                        help='Half-width of the boundary band for boundary-aware BCE. '
-                             '5 keeps the boundary focus tighter for tiny targets.')
+                        help='[legacy only] Focusing exponent for Focal-Tversky. 1.0 is a good starting point for tiny targets.')
     parser.add_argument('--size_rates',  type=str,   default='1',
                         help='Comma-separated multi-scale rates (e.g. "0.75,1,1.25"). '
                              'Default single-scale "1" to keep loss stable on tiny targets.')
@@ -455,11 +582,88 @@ if __name__ == "__main__":
                              'and skip mismatching decoder / EFC layers.')
     parser.add_argument('--strict_load', action='store_true',
                         help='Require a strict state_dict match (default: tolerant).')
+    parser.add_argument('--backbone_lr_mult', type=float, default=0.1,
+                        help='Backbone LR multiplier. 0.1 is a common default when using ImageNet pretrained backbones.')
+    parser.add_argument('--freeze_backbone_epochs', type=int, default=0,
+                        help='Freeze backbone parameters for the first N epochs, then unfreeze.')
+    parser.add_argument('--cpu', action='store_true',
+                        help='Force CPU training even if CUDA is available (sandbox / debug use).')
+    # ---- Compatibility aliases (silently remapped below so the CLI is friendly)
+    parser.add_argument('--root',  type=str, default=None,
+                        help='[Alias] When set, overrides --train_root/--val_root to this '
+                             'directory AND sets --test_root to "<root>_strat" style naming. '
+                             'Convenience for paired stratify-split datasets.')
+    parser.add_argument('--snapshot', type=str, default=None,
+                        help='[Alias] Same as --save_model: directory to save CODNet_*.pth and Cod_best_fg.pth.')
+    parser.add_argument('--nEpochs', type=int, default=None, dest='nEpochs_alias',
+                        metavar='N',
+                        help='[Alias] Same as --epoch: total epochs to train.  Takes precedence over --epoch when set.')
+    parser.add_argument('--start_epoch', type=int, default=1,
+                        help='Start epoch number used for LR scheduling / resume printouts. '
+                             'Default 1 (from scratch).  Typical warm-start usage: 101 when continuing from epoch-100 ckpt.')
+    parser.add_argument('--min_lr', type=float, default=None,
+                        help='If set, enable a cosine annealing schedule over each --decay_epoch window '
+                             '(wrapped onto adjust_lr so baseline StepLR decay still applies). '
+                             'Leave None for the original plain StepLR schedule.')
+    parser.add_argument('--weight_decay', type=float, default=0.0,
+                        help='AdamW weight decay.  Default 0.0 keeps the original pure Adam behaviour. '
+                             'Typical good default for medical imaging is 1e-4.')
+    parser.add_argument('--use_roi_crop', action='store_true',
+                        help='Use ROI-aware random-crop centred on foreground when available '
+                             '(requires PreprocessedDataset ROI support, which is the default for npy format).')
+
+    # ---- User-specified combined-loss weights (override combined_loss defaults)
+    parser.add_argument('--dice_weight',  type=float, default=None,
+                        help='Override soft-Dice weight in combined loss. Default 0.5 (per user request).')
+    parser.add_argument('--focal_weight', type=float, default=None,
+                        help='Override Binary Focal weight in combined loss. Default 0.3 (per user request).')
+    parser.add_argument('--boundary_weight', type=float, default=None,
+                        help='Override Boundary (band-Dice) weight in combined loss. Default 0.2 (per user request).')
 
 
     opt = parser.parse_args()
 
-    torch.cuda.set_device(opt.gpu)
+    # =====================================================================
+    #   Alias post-processing (fix legacy CLI flags users already typed)
+    # =====================================================================
+    if opt.root is not None:
+        # Common pattern: user points --root at TrainDataset_strat so the
+        # paired test set lives in the same-named TestDataset_strat sibling.
+        opt.train_root = opt.root
+        opt.val_root   = opt.root
+        if opt.test_root == './TestDataset' or opt.test_root == '':
+            import re
+            base = re.sub(r'TrainDataset', 'TestDataset', opt.root, count=1, flags=re.IGNORECASE)
+            if os.path.isdir(base):
+                opt.test_root = base
+    if opt.snapshot is not None:
+        opt.save_model = opt.snapshot
+    if opt.nEpochs_alias is not None:
+        opt.epoch = opt.nEpochs_alias
+
+    # Sanity: start_epoch / epoch
+    if opt.start_epoch < 1:
+        opt.start_epoch = 1
+    if opt.epoch < opt.start_epoch:
+        opt.epoch = opt.start_epoch
+
+    # Combined-loss weight overrides → build a closure with explicit scalars
+    _dw = 0.5 if opt.dice_weight     is None else float(opt.dice_weight)
+    _fw = 0.3 if opt.focal_weight    is None else float(opt.focal_weight)
+    _bw = 0.2 if opt.boundary_weight is None else float(opt.boundary_weight)
+    opt._combined_weights = (_dw, _fw, _bw)
+
+    # Sandbox-friendly device selection: fail softly if CUDA isn't available,
+    # fall back to CPU (with a clear print) unless --cpu is set.
+    if opt.cpu or not torch.cuda.is_available():
+        device = torch.device('cpu')
+        opt.gpu_used = None
+        print('[device] CUDA not available or --cpu set → running on CPU')
+    else:
+        device = torch.device(f'cuda:{opt.gpu}')
+        opt.gpu_used = opt.gpu
+        torch.cuda.set_device(opt.gpu)
+        print(f'[device] using cuda:{opt.gpu}')
 
     save_path = opt.save_model
     os.makedirs(save_path, exist_ok=True)
@@ -476,7 +680,15 @@ if __name__ == "__main__":
     # Paired T1/T2 dataset → must use dual_backbone=True so the two
     # encoders are separate and FFTCMA / GlobalFusion can actually fuse
     # the two modalities (otherwise both inputs are the same image).
-    model = CFANet(channel=64, dual_backbone=True).cuda()
+    #
+    # --k_slice controls pseudo-3D input width per modality:
+    #   3  = legacy 2.5D (centre ± 1 slice)
+    #   9  = centre ± 4 slices — smooth slice continuity in receptive field
+    #   15 = centre ± 7 slices — full 3D context over the typical neck volume
+    # The encoder's first conv weight is linearly interpolated from the 3ch
+    # ImageNet init when k_slice > 3, so training starts from a meaningful
+    # visual representation (not random).
+    model = CFANet(channel=64, dual_backbone=True, in_channels=opt.k_slice).to(device)
     #print('-' * 30, model, '-' * 30)
 
     # =================================================================
@@ -503,8 +715,18 @@ if __name__ == "__main__":
     # =================================================================
     if opt.pretrain_ckpt and os.path.isfile(opt.pretrain_ckpt):
         print('Loading pretrained weights from {}'.format(opt.pretrain_ckpt))
-        ckpt = torch.load(opt.pretrain_ckpt, map_location='cuda:{}'.format(opt.gpu))
+        ckpt = torch.load(opt.pretrain_ckpt, map_location=device)
         ckpt = unwrap_state_dict(ckpt)
+
+        # --k_slice transfer: if this checkpoint was trained with a different
+        # k_slice (legacy default = 3), remap the backbone input convs so the
+        # whole decoder / fuser still transfer 1:1.  Only conv1.0.weight
+        # changes shape; all later layers are identical regardless of k_slice.
+        try:
+            from lib.model import remap_ckpt_in_channels
+            ckpt = remap_ckpt_in_channels(ckpt, in_channels_new=opt.k_slice)
+        except Exception as _e:
+            print(f'  [warn] remap_ckpt_in_channels failed: {_e}. Using raw ckpt.')
 
         model_dict = model.state_dict()
 
@@ -548,16 +770,57 @@ if __name__ == "__main__":
 
 
 
-    optimizer = torch.optim.Adam(model.parameters(), opt.lr)
+    if opt.freeze_backbone_epochs and opt.freeze_backbone_epochs > 0:
+        for n, p in model.named_parameters():
+            if n.startswith('backbone_t1.') or n.startswith('backbone_t2.'):
+                p.requires_grad = False
+
+    bb_mult = float(opt.backbone_lr_mult)
+    if bb_mult <= 0:
+        raise ValueError('--backbone_lr_mult must be > 0')
+    if abs(bb_mult - 1.0) < 1e-9:
+        optimizer = torch.optim.AdamW(
+            (p for p in model.parameters() if p.requires_grad),
+            opt.lr, weight_decay=float(opt.weight_decay),
+        )
+    else:
+        backbone_params = []
+        other_params = []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.startswith('backbone_t1.') or n.startswith('backbone_t2.'):
+                backbone_params.append(p)
+            else:
+                other_params.append(p)
+        optimizer = torch.optim.AdamW(
+            [
+                {'params': backbone_params, 'lr': opt.lr * bb_mult,
+                 '_bb_factor': float(bb_mult)},
+                {'params': other_params,    'lr': opt.lr,
+                 '_bb_factor': 1.0},
+            ],
+            weight_decay=float(opt.weight_decay),
+        )
 
     # "训练前准备区"代码，负责把损失函数、深监督权重、三个数据加载器全部装配好
-    def make_loss(p, m):
-        return small_target_loss(
-            p, m,
-            w_ft=opt.w_ft, w_bce=opt.w_bce, w_dice=opt.w_dice,
-            ft_alpha=opt.ft_alpha, ft_beta=opt.ft_beta,
-            ft_gamma=opt.ft_gamma, boundary_k=opt.boundary_k,
-        )
+    if opt.loss_fn == 'combined':
+        _dw, _fw, _bw = opt._combined_weights
+        # Close over the (possibly CLI-overridden) Dice/Focal/Boundary weights
+        # so the user's explicit 0.5 / 0.3 / 0.2 request is honoured.
+        def make_loss(p, m, _dw=_dw, _fw=_fw, _bw=_bw):
+            dice  = dice_loss(p, m)
+            focal = binary_focal_loss(p, m, alpha=opt.fl_alpha, gamma=opt.fl_gamma)
+            bound = boundary_loss(p, m, k=opt.boundary_k)
+            return _dw * dice + _fw * focal + _bw * bound
+    else:  # small_target_legacy
+        def make_loss(p, m):
+            return small_target_loss(
+                p, m,
+                w_ft=opt.w_ft, w_bce=opt.w_bce, w_dice=opt.w_dice,
+                ft_alpha=opt.ft_alpha, ft_beta=opt.ft_beta,
+                ft_gamma=opt.ft_gamma, boundary_k=opt.boundary_k,
+            )
     loss_func = make_loss
     deep_sup_w = tuple(float(x) for x in opt.deep_sup_w.split(','))
     assert len(deep_sup_w) == 4, f'--deep_sup_w must have 4 values, got {opt.deep_sup_w}'
@@ -576,7 +839,9 @@ if __name__ == "__main__":
                               val_ratio=opt.val_ratio,
                               test_ratio=opt.test_ratio,
                               data_format=opt.data_format,
-                              pos_sample_weight=opt.pos_sample_weight)
+                              pos_sample_weight=opt.pos_sample_weight,
+                              k_slice=opt.k_slice,
+                              use_roi_crop=opt.use_roi_crop)
     val_loader   = get_loader(opt.val_root, split='val',
                               batchsize=opt.batchsize, trainsize=opt.trainsize,
                               num_workers=loader_workers, augment=False,
@@ -586,7 +851,9 @@ if __name__ == "__main__":
                               val_ratio=opt.val_ratio,
                               test_ratio=opt.test_ratio,
                               data_format=opt.data_format,
-                              pos_sample_weight=1.0)
+                              pos_sample_weight=1.0,
+                              k_slice=opt.k_slice,
+                              use_roi_crop=False)
     test_loader  = get_loader(opt.test_root, split='test',
                               batchsize=opt.batchsize, trainsize=opt.trainsize,
                               num_workers=loader_workers, augment=False,
@@ -596,7 +863,9 @@ if __name__ == "__main__":
                               val_ratio=opt.val_ratio,
                               test_ratio=opt.test_ratio,
                               data_format=opt.data_format,
-                              pos_sample_weight=1.0)
+                              pos_sample_weight=1.0,
+                              k_slice=opt.k_slice,
+                              use_roi_crop=False)
 
     total_step = len(train_loader)
 
@@ -606,9 +875,14 @@ if __name__ == "__main__":
                                              opt.test_root, opt.lr, opt.batchsize,
                                              opt.save_model, total_step), '-' * 30)
 
-    for epoch_iter in range(1, opt.epoch + 1):
+    for epoch_iter in range(int(opt.start_epoch), int(opt.epoch) + 1):
+        if opt.freeze_backbone_epochs and epoch_iter == int(opt.freeze_backbone_epochs) + 1:
+            for n, p in model.named_parameters():
+                if n.startswith('backbone_t1.') or n.startswith('backbone_t2.'):
+                    p.requires_grad = True
 
-        adjust_lr(optimizer, epoch_iter, opt.decay_rate, opt.decay_epoch)
+        adjust_lr(optimizer, epoch_iter, opt.decay_rate, opt.decay_epoch,
+                  min_lr=opt.min_lr)
 
         train(train_loader, model, optimizer, epoch_iter, opt, loss_func, total_step,
               deep_sup_w=deep_sup_w, grad_clip=opt.grad_clip)

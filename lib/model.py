@@ -38,7 +38,7 @@ class FSCM(nn.Module):
           The two names refer to the same operator.
     """
     def __init__(self, in_channels1, in_channels2, out_channels):
-        super(FFTCMA, self).__init__()
+        super(FSCM, self).__init__()
         self.reduce1 = BasicConv2d(in_channels1, out_channels, 1)
         self.reduce2 = BasicConv2d(in_channels2, out_channels, 1)
 
@@ -82,6 +82,7 @@ class FSCM(nn.Module):
 
 
 # Alias — FFTCMA is identical to FSCM (Frequency-domain Spectral Cross-Modal).
+FFTCMA = FSCM
 
 
 ###############################################################################
@@ -111,6 +112,22 @@ class GlobalFusion(nn.Module):
 ###############################################################################
 ##  Edge Block (Edge 0/1/2/3) — Top-branch feature refinement
 ###############################################################################
+class EdgeBlock(nn.Module):
+    def __init__(self, channels):
+        super(EdgeBlock, self).__init__()
+        self.refine = nn.Sequential(
+            BasicConv2d(channels, channels, 3, padding=1),
+            BasicConv2d(channels, channels, 3, padding=1),
+        )
+        self.edge_gate = nn.Sequential(
+            nn.Conv2d(channels, 1, kernel_size=1, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        r = self.refine(x)
+        g = self.edge_gate(r)
+        return x + r * g
 
 ###############################################################################
 ##  Cross-level Fusion Skip (CF) — simple skip connection (fallback)
@@ -212,7 +229,7 @@ EFA = EFC
 ##      * Returns (mask1, mask2, mask3, mask)
 ###############################################################################
 class CFANet(nn.Module):
-    def __init__(self, channel=64, dual_backbone=True):
+    def __init__(self, channel=64, dual_backbone=True, in_channels=3):
         """
         Args:
             channel (int): base channel width for all branches.
@@ -221,15 +238,24 @@ class CFANet(nn.Module):
                          (suitable for true cross-modal input).
                 False -> a single shared backbone, T1 == T2 == x
                          (suitable for single-image input).
+            in_channels (int):
+                Number of input channels per modality.  For the standard 2.5D
+                stack this is ``3`` (centre ± 1 slice).  For pseudo-3D input
+                pass an odd integer ``k_slice`` in {5, 7, 9, ...} to take a
+                wider z context.  The first-conv weights are automatically
+                interpolated from the 3-ch ImageNet checkpoint in
+                ``Res2Net_model(..., in_channels)``.
         """
         super(CFANet, self).__init__()
+        self.dual_backbone = bool(dual_backbone)
+        self.in_channels = int(in_channels)
 
         # ---- Dual backbone encoders ----
         if dual_backbone:
-            self.backbone_t1 = Res2Net_model(50)
-            self.backbone_t2 = Res2Net_model(50)
+            self.backbone_t1 = Res2Net_model(50, in_channels=in_channels)
+            self.backbone_t2 = Res2Net_model(50, in_channels=in_channels)
         else:
-            shared = Res2Net_model(50)
+            shared = Res2Net_model(50, in_channels=in_channels)
             self.backbone_t1 = shared
             self.backbone_t2 = shared
 
@@ -286,18 +312,22 @@ class CFANet(nn.Module):
     def forward(self, x1, x2=None):
         """
         Args:
-            x1 (Tensor): first  input image  (N, 3, H, W)
-            x2 (Tensor): second input image  (N, 3, H, W). If None, x2 = x1.
+            x1 (Tensor): first  input image  (N, C, H, W); C = in_channels
+            x2 (Tensor): second input image  (N, C, H, W). If None, x2 = x1.
         Returns:
             mask1, mask2, mask3, mask  (all logits, N x 1 x H x W)
         """
+        shared_single_input = (x2 is None) and (not self.dual_backbone)
         if x2 is None:
             x2 = x1
         H, W = x1.shape[-2:]
 
         # ---- Encoder features ----
         _, t1_1, t1_2, t1_3, t1_4 = self.backbone_t1(x1)
-        _, t2_1, t2_2, t2_3, t2_4 = self.backbone_t2(x2)
+        if shared_single_input:
+            t2_1, t2_2, t2_3, t2_4 = t1_1, t1_2, t1_3, t1_4
+        else:
+            _, t2_1, t2_2, t2_3, t2_4 = self.backbone_t2(x2)
 
         # ---- 4-level cross-modal fusion ----
         # X0 from FFT-CMA (shallowest, two streams at the highest resolution)
@@ -346,3 +376,54 @@ class CFANet(nn.Module):
                              mode='bilinear', align_corners=False)
 
         return mask1, mask2, mask3, mask
+
+
+# ---------------------------------------------------------------------------
+# Helper: remap a 3-channel checkpoint trained with in_channels=3 onto an
+# arbitrary k_slice > 3 network.  We only need to fix the two backbone
+# conv1.0.weight tensors (T1 + T2).  All later conv/bn/fusion layers are
+# independent of input channel count and transfer directly.
+# Used by train.py --pretrain_ckpt to warm-start k_slice=9 / k_slice=15 runs
+# from the existing epoch100 2.5D (k=3) Cod_best_fg checkpoint.
+# ---------------------------------------------------------------------------
+def remap_ckpt_in_channels(ckpt_state: dict, in_channels_new: int,
+                           in_channels_old: int = 3) -> dict:
+    """Return a state_dict ready to be loaded into a CFANet with k_slice>3.
+
+    Parameters
+    ----------
+    ckpt_state : dict
+        state_dict from a 3-channel checkpoint (as saved by train.py).
+    in_channels_new : int
+        Target ``k_slice`` (the new input channels per modality). Must be >= 1.
+    in_channels_old : int
+        Usually 3 (the legacy 2.5D stack).
+
+    Returns
+    -------
+    dict
+        New state dict.  Only ``backbone_t1.conv1.0.weight`` and
+        ``backbone_t2.conv1.0.weight`` are modified; every other tensor is
+        a reference to the input (no copies).
+    """
+    import torch as _torch
+    out = dict(ckpt_state)  # shallow copy
+    for bb_key in ("backbone_t1.conv1.0.weight", "backbone_t2.conv1.0.weight"):
+        if bb_key not in out:
+            continue
+        w_old = out[bb_key]  # (Cout, 3, k, k)
+        if w_old.ndim != 4 or w_old.shape[1] != in_channels_old:
+            continue
+        if in_channels_new == in_channels_old:
+            continue
+        Cout, Cin_old, kh, kw = w_old.shape
+        flat = w_old.reshape(Cout, Cin_old, kh * kw).permute(0, 2, 1).contiguous()
+        scaled = _torch.nn.functional.interpolate(
+            flat.float(), size=in_channels_new, mode='linear', align_corners=False
+        )
+        w_new = scaled.permute(0, 2, 1).reshape(Cout, in_channels_new, kh, kw).contiguous()
+        # Re-scale magnitude so total energy per output channel matches the
+        # 3-ch case (avoids exploding activations for k>3).
+        w_new = w_new * (float(Cin_old) / float(in_channels_new))
+        out[bb_key] = w_new.to(dtype=w_old.dtype)
+    return out
